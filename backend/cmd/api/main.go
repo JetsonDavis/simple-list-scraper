@@ -18,10 +18,12 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"syscall"
 	"time"
 
+	"github.com/gorilla/websocket"
 	_ "github.com/lib/pq"
 	"github.com/lithammer/fuzzysearch/fuzzy"
 	"github.com/playwright-community/playwright-go"
@@ -31,6 +33,13 @@ var (
     db            *sql.DB
     workerRunning atomic.Bool
     ollamaCmd     *exec.Cmd
+    wsClients     = make(map[*websocket.Conn]bool)
+    wsClientsMux  sync.Mutex
+    wsUpgrader    = websocket.Upgrader{
+        CheckOrigin: func(r *http.Request) bool {
+            return true // Allow all origins for development
+        },
+    }
 )
 
 type Item struct {
@@ -141,7 +150,9 @@ func main() {
     mux.HandleFunc("/api/urls", urlsHandler)
     mux.HandleFunc("/api/urls/", urlHandler)
     mux.HandleFunc("/api/matches", matchesHandler)
+    mux.HandleFunc("/api/matches/", matchHandler)
     mux.HandleFunc("/api/trigger-worker", triggerWorkerHandler)
+    mux.HandleFunc("/api/ws", wsHandler)
     mux.HandleFunc("/api/health", func(w http.ResponseWriter, r *http.Request) {
         writeJSON(w, map[string]any{"status": "ok"})
     })
@@ -226,12 +237,16 @@ func runWorker() {
         log.Println("Worker already running, skipping")
         return
     }
-    defer workerRunning.Store(false)
+    defer func() {
+        workerRunning.Store(false)
+        broadcastWorkerStatus("completed", "Worker finished")
+    }()
 
     disablePW := strings.ToLower(os.Getenv("DISABLE_PLAYWRIGHT")) == "true"
     threshold := getenvFloat("FUZZY_THRESHOLD", 0.78)
 
     log.Printf("Worker started (threshold=%.2f, playwright_disabled=%v)\n", threshold, disablePW)
+    broadcastWorkerStatus("running", "Worker started")
 
     items, err := loadItems()
     if err != nil {
@@ -390,6 +405,15 @@ func runWorker() {
                 if inserted {
                     log.Printf("MATCH site=%s item=%q title=%q url=%s\n",
                         s.Name(), it.Text, r.Title, r.URL)
+
+                    // Broadcast new match via WebSocket
+                    broadcastNewMatch(map[string]any{
+                        "item":         it.Text,
+                        "url":          r.URL,
+                        "site":         s.Name(),
+                        "torrent_text": r.Title,
+                        "created":      time.Now().Format(time.RFC3339),
+                    })
 
                     if err := maybeSendTwilioSMS(it.Text, r.Title, r.URL, s.Name()); err != nil {
                         log.Printf("twilio sms error: %v\n", err)
@@ -1055,6 +1079,28 @@ func matchesHandler(w http.ResponseWriter, r *http.Request) {
     writeJSON(w, out)
 }
 
+func matchHandler(w http.ResponseWriter, r *http.Request) {
+    if r.Method != http.MethodDelete {
+        w.WriteHeader(http.StatusMethodNotAllowed)
+        return
+    }
+
+    idStr := strings.TrimPrefix(r.URL.Path, "/api/matches/")
+    id, err := strconv.ParseInt(idStr, 10, 64)
+    if err != nil {
+        http.Error(w, "Invalid match ID", http.StatusBadRequest)
+        return
+    }
+
+    _, err = db.Exec("DELETE FROM matches WHERE id=$1", id)
+    if err != nil {
+        http.Error(w, err.Error(), http.StatusInternalServerError)
+        return
+    }
+
+    writeJSON(w, map[string]any{"ok": true})
+}
+
 func triggerWorkerHandler(w http.ResponseWriter, r *http.Request) {
     if r.URL.RawQuery != "" {
         log.Printf("POST /api/trigger-worker - Query params: %s", r.URL.RawQuery)
@@ -1081,6 +1127,74 @@ func triggerWorkerHandler(w http.ResponseWriter, r *http.Request) {
         "status":  "triggered",
         "message": "Worker triggered successfully",
     })
+}
+
+func wsHandler(w http.ResponseWriter, r *http.Request) {
+    conn, err := wsUpgrader.Upgrade(w, r, nil)
+    if err != nil {
+        log.Printf("WebSocket upgrade error: %v", err)
+        return
+    }
+    
+    wsClientsMux.Lock()
+    wsClients[conn] = true
+    wsClientsMux.Unlock()
+    
+    log.Printf("WebSocket client connected. Total clients: %d", len(wsClients))
+    
+    // Keep connection alive and handle disconnection
+    defer func() {
+        wsClientsMux.Lock()
+        delete(wsClients, conn)
+        wsClientsMux.Unlock()
+        conn.Close()
+        log.Printf("WebSocket client disconnected. Total clients: %d", len(wsClients))
+    }()
+    
+    // Read messages from client (ping/pong to keep alive)
+    for {
+        _, _, err := conn.ReadMessage()
+        if err != nil {
+            break
+        }
+    }
+}
+
+func broadcastWorkerStatus(status string, message string) {
+    wsClientsMux.Lock()
+    defer wsClientsMux.Unlock()
+    
+    msg := map[string]any{
+        "type":    "worker_status",
+        "status":  status,
+        "message": message,
+    }
+    
+    for client := range wsClients {
+        if err := client.WriteJSON(msg); err != nil {
+            log.Printf("WebSocket write error: %v", err)
+            client.Close()
+            delete(wsClients, client)
+        }
+    }
+}
+
+func broadcastNewMatch(match map[string]any) {
+    wsClientsMux.Lock()
+    defer wsClientsMux.Unlock()
+    
+    msg := map[string]any{
+        "type":  "new_match",
+        "match": match,
+    }
+    
+    for client := range wsClients {
+        if err := client.WriteJSON(msg); err != nil {
+            log.Printf("WebSocket write error: %v", err)
+            client.Close()
+            delete(wsClients, client)
+        }
+    }
 }
 
 func writeJSON(w http.ResponseWriter, v any) {

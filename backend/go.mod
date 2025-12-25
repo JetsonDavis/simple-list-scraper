@@ -3,6 +3,7 @@ module simple-list-scraper
 go 1.22
 
 require (
+	github.com/gorilla/websocket v1.5.3
 	github.com/lib/pq v1.10.9
 	github.com/lithammer/fuzzysearch v1.1.8
 	github.com/playwright-community/playwright-go v0.4501.1

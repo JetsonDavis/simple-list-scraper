@@ -15,19 +15,43 @@ export default function App() {
   const [text, setText] = useState("");
   const [urlText, setUrlText] = useState("");
   const [triggering, setTriggering] = useState(false);
-  const [polling, setPolling] = useState(false);
+  const [ws, setWs] = useState<WebSocket | null>(null);
 
   async function loadItems() {
-    const res = await fetch("/api/items");
-    setItems(await res.json());
+    try {
+      const res = await fetch("/api/items");
+      if (!res.ok) {
+        console.error("Failed to load items:", res.status);
+        return;
+      }
+      setItems(await res.json());
+    } catch (err) {
+      console.error("Error loading items:", err);
+    }
   }
   async function loadUrls() {
-    const res = await fetch("/api/urls");
-    setUrls(await res.json());
+    try {
+      const res = await fetch("/api/urls");
+      if (!res.ok) {
+        console.error("Failed to load URLs:", res.status);
+        return;
+      }
+      setUrls(await res.json());
+    } catch (err) {
+      console.error("Error loading URLs:", err);
+    }
   }
   async function loadMatches() {
-    const res = await fetch("/api/matches");
-    setMatches(await res.json());
+    try {
+      const res = await fetch("/api/matches");
+      if (!res.ok) {
+        console.error("Failed to load matches:", res.status);
+        return;
+      }
+      setMatches(await res.json());
+    } catch (err) {
+      console.error("Error loading matches:", err);
+    }
   }
 
   useEffect(() => { loadItems(); loadUrls(); }, []);
@@ -36,16 +60,48 @@ export default function App() {
     if (tab === "matches") loadMatches();
   }, [tab]);
 
-  // Poll matches while worker is running
+  // WebSocket connection for real-time updates
   useEffect(() => {
-    if (!polling) return;
+    const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+    const wsUrl = `${protocol}//${window.location.host}/api/ws`;
+    const websocket = new WebSocket(wsUrl);
 
-    const interval = setInterval(() => {
-      loadMatches();
-    }, 2000); // Poll every 2 seconds
+    websocket.onopen = () => {
+      console.log('WebSocket connected');
+    };
 
-    return () => clearInterval(interval);
-  }, [polling]);
+    websocket.onmessage = (event) => {
+      const data = JSON.parse(event.data);
+      
+      if (data.type === 'worker_status') {
+        console.log('Worker status:', data.status, data.message);
+        if (data.status === 'running') {
+          setTriggering(true);
+        } else if (data.status === 'completed') {
+          setTriggering(false);
+          loadMatches(); // Final load when worker completes
+        }
+      } else if (data.type === 'new_match') {
+        console.log('New match:', data.match);
+        // Add new match to the list
+        setMatches(prev => [data.match, ...prev]);
+      }
+    };
+
+    websocket.onerror = (error) => {
+      console.error('WebSocket error:', error);
+    };
+
+    websocket.onclose = () => {
+      console.log('WebSocket disconnected');
+    };
+
+    setWs(websocket);
+
+    return () => {
+      websocket.close();
+    };
+  }, []);
 
   async function add() {
     const v = text.trim();
@@ -81,8 +137,27 @@ export default function App() {
       await loadItems();
     } catch (err) {
       console.error("Delete error:", err);
-      alert(`Error deleting item: ${err}`);
+      alert("Failed to delete item");
+      return;
     }
+  }
+
+  async function removeMatch(id: number) {
+    if (!confirm("Delete this match?")) return;
+    try {
+      const res = await fetch(`/api/matches/${id}`, { method: "DELETE" });
+      if (!res.ok) {
+        const text = await res.text();
+        console.error("Delete match failed:", res.status, text);
+        alert(`Failed to delete match: ${text}`);
+        return;
+      }
+    } catch (err) {
+      console.error("Delete match error:", err);
+      alert("Failed to delete match");
+      return;
+    }
+    await loadMatches();
   }
 
   async function addUrl() {
@@ -116,41 +191,19 @@ export default function App() {
   }
 
   async function triggerWorker() {
-    setTriggering(true);
-    setPolling(true); // Start polling for updates
     try {
       const res = await fetch("/api/trigger-worker", { method: "POST" });
       const data = await res.json();
       
-      // Poll worker status until it completes
-      const checkWorkerStatus = async () => {
-        try {
-          const statusRes = await fetch("/api/trigger-worker", { method: "POST" });
-          const statusData = await statusRes.json();
-          
-          // If worker is already running, keep checking
-          if (statusData.status === "already_running") {
-            setTimeout(checkWorkerStatus, 2000); // Check again in 2 seconds
-          } else {
-            // Worker has finished
-            setPolling(false);
-            setTriggering(false);
-            await loadMatches(); // Final load
-            alert("Worker completed");
-          }
-        } catch (err) {
-          // If there's an error, assume worker finished
-          setPolling(false);
-          setTriggering(false);
-          await loadMatches();
-        }
-      };
-      
-      // Start checking after 2 seconds
-      setTimeout(checkWorkerStatus, 2000);
+      if (data.status === "already_running") {
+        alert("Worker is already running");
+      } else if (data.status === "triggered") {
+        // Set spinner immediately when worker starts
+        setTriggering(true);
+        // WebSocket will handle updates and turn off spinner when completed
+      }
     } catch (err) {
       alert("Failed to trigger worker");
-      setPolling(false);
       setTriggering(false);
     }
   }
@@ -302,6 +355,7 @@ export default function App() {
                 <th style={{ width: '30%' }}>Torrent Text</th>
                 <th>URL</th>
                 <th style={{ width: '180px' }}>When</th>
+                <th style={{ width: '80px', textAlign: 'center' }}>Action</th>
               </tr>
             </thead>
             <tbody>
@@ -312,6 +366,35 @@ export default function App() {
                   <td>{m.torrent_text || ''}</td>
                   <td><a href={m.url} target="_blank" rel="noreferrer">{m.url}</a></td>
                   <td>{m.created}</td>
+                  <td style={{ textAlign: 'center' }}>
+                    <button 
+                      className="small" 
+                      onClick={() => removeMatch(m.id)}
+                      style={{ 
+                        background: 'transparent', 
+                        border: 'none', 
+                        cursor: 'pointer',
+                        padding: '4px'
+                      }}
+                      title="Delete match"
+                    >
+                      <svg 
+                        width="18" 
+                        height="18" 
+                        viewBox="0 0 24 24" 
+                        fill="none" 
+                        stroke="#D13438" 
+                        strokeWidth="2" 
+                        strokeLinecap="round" 
+                        strokeLinejoin="round"
+                      >
+                        <polyline points="3 6 5 6 21 6"></polyline>
+                        <path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"></path>
+                        <line x1="10" y1="11" x2="10" y2="17"></line>
+                        <line x1="14" y1="11" x2="14" y2="17"></line>
+                      </svg>
+                    </button>
+                  </td>
                 </tr>
               ))}
             </tbody>
