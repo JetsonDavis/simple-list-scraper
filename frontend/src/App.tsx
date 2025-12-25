@@ -3,15 +3,20 @@ import { useEffect, useState } from "react";
 type Item = { id: number; text: string };
 type URL = { id: number; url: string; display_name?: string; config?: string };
 type Match = { id: number; item: string; url: string; site: string; torrent_text?: string; magnet_link?: string; created: string };
+type Log = { id: number; timestamp: string; description: string; success: boolean };
+type LogsResponse = { logs: Log[]; page: number; page_size: number; total: number; total_pages: number };
 
 export default function App() {
-  const [tab, setTab] = useState<"items" | "urls" | "matches">(() => {
+  const [tab, setTab] = useState<"items" | "urls" | "matches" | "logs">(() => {
     const savedTab = localStorage.getItem("selectedTab");
-    return (savedTab === "items" || savedTab === "urls" || savedTab === "matches") ? savedTab : "items";
+    return (savedTab === "items" || savedTab === "urls" || savedTab === "matches" || savedTab === "logs") ? savedTab : "items";
   });
   const [items, setItems] = useState<Item[]>([]);
   const [urls, setUrls] = useState<URL[]>([]);
   const [matches, setMatches] = useState<Match[]>([]);
+  const [logs, setLogs] = useState<Log[]>([]);
+  const [logsPage, setLogsPage] = useState(1);
+  const [logsTotalPages, setLogsTotalPages] = useState(0);
   const [text, setText] = useState("");
   const [urlText, setUrlText] = useState("");
   const [triggering, setTriggering] = useState(false);
@@ -54,10 +59,39 @@ export default function App() {
     }
   }
 
+  async function loadLogs(page: number = 1) {
+    try {
+      const res = await fetch(`/api/logs?page=${page}`);
+      if (!res.ok) {
+        console.error("Failed to load logs:", res.status);
+        return;
+      }
+      const data: LogsResponse = await res.json();
+      setLogs(data.logs);
+      setLogsPage(data.page);
+      setLogsTotalPages(data.total_pages);
+    } catch (err) {
+      console.error("Error loading logs:", err);
+    }
+  }
+
   useEffect(() => { loadItems(); loadUrls(); }, []);
   useEffect(() => {
     localStorage.setItem("selectedTab", tab);
-    if (tab === "matches") loadMatches();
+    if (tab === "matches") {
+      loadMatches();
+      // Check worker status when opening matches tab to ensure spinner is correct
+      fetch("/api/worker-status")
+        .then(res => res.json())
+        .then(data => {
+          if (data.running === false) {
+            setTriggering(false);
+          }
+        })
+        .catch(err => console.error("Failed to check worker status:", err));
+    } else if (tab === "logs") {
+      loadLogs(1);
+    }
   }, [tab]);
 
   // WebSocket connection for real-time updates
@@ -85,6 +119,10 @@ export default function App() {
         console.log('New match:', data.match);
         // Add new match to the list
         setMatches(prev => [data.match, ...prev]);
+      } else if (data.type === 'new_log') {
+        console.log('New log:', data.log);
+        // Add new log to the list if on logs tab
+        setLogs(prev => [data.log, ...prev]);
       }
     };
 
@@ -106,12 +144,31 @@ export default function App() {
   async function add() {
     const v = text.trim();
     if (!v) return;
-    await fetch("/api/items", {
-      method: "POST",
-      body: new URLSearchParams({ text: v }),
-    });
-    setText("");
-    await loadItems();
+    try {
+      console.log("Adding item:", v);
+      const res = await fetch("/api/items", {
+        method: "POST",
+        body: new URLSearchParams({ text: v }),
+      });
+      if (!res.ok) {
+        if (res.status === 409) {
+          // Conflict - item already exists
+          const data = await res.json();
+          alert(data.error || "Item already exists");
+          return;
+        }
+        console.error("Failed to add item:", res.status);
+        alert(`Failed to add item: ${res.status}`);
+        return;
+      }
+      console.log("Item added successfully, clearing input and reloading...");
+      setText("");
+      await loadItems();
+      console.log("Items reloaded, new count:", items.length);
+    } catch (err) {
+      console.error("Error adding item:", err);
+      alert("Failed to add item");
+    }
   }
 
   async function update(id: number, newText: string) {
@@ -143,15 +200,19 @@ export default function App() {
   }
 
   async function removeMatch(id: number) {
+    console.log("removeMatch called with ID:", id);
     if (!confirm("Delete this match?")) return;
     try {
-      const res = await fetch(`/api/matches/${id}`, { method: "DELETE" });
+      const url = `/api/matches/${id}`;
+      console.log("Sending DELETE request to:", url);
+      const res = await fetch(url, { method: "DELETE" });
       if (!res.ok) {
         const text = await res.text();
         console.error("Delete match failed:", res.status, text);
         alert(`Failed to delete match: ${text}`);
         return;
       }
+      console.log("Delete successful, reloading matches...");
     } catch (err) {
       console.error("Delete match error:", err);
       alert("Failed to delete match");
@@ -222,11 +283,14 @@ export default function App() {
         <button className={"tab " + (tab === "items" ? "active" : "")} onClick={() => setTab("items")}>
           Items
         </button>
-        <button className={"tab " + (tab === "urls" ? "active" : "")} onClick={() => setTab("urls")}>
-          URLs
-        </button>
         <button className={"tab " + (tab === "matches" ? "active" : "")} onClick={() => setTab("matches")}>
           Matches
+        </button>
+        <button className={"tab " + (tab === "urls" ? "active" : "")} onClick={() => setTab("urls")}>
+          Sites
+        </button>
+        <button className={"tab " + (tab === "logs" ? "active" : "")} onClick={() => setTab("logs")}>
+          Logs
         </button>
       </div>
 
@@ -347,16 +411,15 @@ export default function App() {
           <div className="hint">
             Matches are deduped on (item_id, matched_url, source_site). New inserts can trigger Twilio SMS if configured.
           </div>
-          <table className="table">
+          <table className="table" style={{ width: '100%' }}>
             <thead>
               <tr>
-                <th style={{ width: '15%' }}>Item</th>
-                <th style={{ width: '8%' }}>Site</th>
-                <th style={{ width: '25%' }}>Torrent Text</th>
-                <th style={{ width: '30%' }}>URL</th>
-                <th style={{ width: '60px', textAlign: 'center' }}>Magnet</th>
-                <th style={{ width: '140px' }}>When</th>
-                <th style={{ width: '60px', textAlign: 'center' }}>Action</th>
+                <th style={{ width: '15%' }}>ITEM</th>
+                <th style={{ width: '10%' }}>SITE</th>
+                <th style={{ width: '55%' }}>TORRENT TEXT</th>
+                <th style={{ width: '8%', textAlign: 'center' }}>MAGNET</th>
+                <th style={{ width: '12%' }}>WHEN</th>
+                <th style={{ width: '8%', textAlign: 'center' }}>ACTION</th>
               </tr>
             </thead>
             <tbody>
@@ -364,8 +427,11 @@ export default function App() {
                 <tr key={m.id}>
                   <td>{m.item}</td>
                   <td>{m.site}</td>
-                  <td>{m.torrent_text || ''}</td>
-                  <td><a href={m.url} target="_blank" rel="noreferrer">{m.url}</a></td>
+                  <td>
+                    <a href={m.url} target="_blank" rel="noreferrer" style={{ color: '#0078D4', textDecoration: 'none' }}>
+                      {m.torrent_text || m.url}
+                    </a>
+                  </td>
                   <td style={{ textAlign: 'center' }}>
                     {m.magnet_link ? (
                       <a href={m.magnet_link} title="Open magnet link">
@@ -388,7 +454,7 @@ export default function App() {
                       <span style={{ color: '#999' }}>-</span>
                     )}
                   </td>
-                  <td>{m.created}</td>
+                  <td style={{ whiteSpace: 'nowrap' }}>{m.created}</td>
                   <td style={{ textAlign: 'center' }}>
                     <button 
                       className="small" 
@@ -422,6 +488,71 @@ export default function App() {
               ))}
             </tbody>
           </table>
+        </div>
+      )}
+
+      {tab === "logs" && (
+        <div className="tab-content">
+          <div className="hint">
+            Logs show the completion status of each item processed by the worker.
+          </div>
+          <table className="table" style={{ width: '100%' }}>
+            <thead>
+              <tr>
+                <th style={{ width: '180px' }}>TIMESTAMP</th>
+                <th style={{ width: 'auto' }}>DESCRIPTION</th>
+                <th style={{ width: '100px', textAlign: 'center' }}>STATUS</th>
+              </tr>
+            </thead>
+            <tbody>
+              {logs.map((log) => (
+                <tr key={log.id}>
+                  <td style={{ whiteSpace: 'nowrap', fontSize: '13px' }}>
+                    {new Date(log.timestamp).toLocaleString()}
+                  </td>
+                  <td>{log.description}</td>
+                  <td style={{ textAlign: 'center' }}>
+                    <span style={{ 
+                      padding: '4px 8px', 
+                      borderRadius: '4px', 
+                      fontSize: '12px',
+                      fontWeight: 'bold',
+                      backgroundColor: log.success ? '#d4edda' : '#f8d7da',
+                      color: log.success ? '#155724' : '#721c24'
+                    }}>
+                      {log.success ? 'SUCCESS' : 'FAILED'}
+                    </span>
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+          
+          {logsTotalPages > 1 && (
+            <div style={{ 
+              display: 'flex', 
+              justifyContent: 'center', 
+              alignItems: 'center', 
+              gap: '10px', 
+              marginTop: '20px' 
+            }}>
+              <button 
+                onClick={() => loadLogs(logsPage - 1)} 
+                disabled={logsPage === 1}
+                style={{ padding: '8px 16px' }}
+              >
+                Previous
+              </button>
+              <span>Page {logsPage} of {logsTotalPages}</span>
+              <button 
+                onClick={() => loadLogs(logsPage + 1)} 
+                disabled={logsPage === logsTotalPages}
+                style={{ padding: '8px 16px' }}
+              >
+                Next
+              </button>
+            </div>
+          )}
         </div>
       )}
     </div>
