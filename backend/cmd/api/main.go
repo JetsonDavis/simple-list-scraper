@@ -76,6 +76,7 @@ type OllamaRequest struct {
     Model  string `json:"model"`
     Prompt string `json:"prompt"`
     Stream bool   `json:"stream"`
+    Format string `json:"format,omitempty"`
 }
 
 type OllamaResponse struct {
@@ -152,7 +153,9 @@ func main() {
     mux.HandleFunc("/api/urls/", urlHandler)
     mux.HandleFunc("/api/matches", matchesHandler)
     mux.HandleFunc("/api/matches/", matchHandler)
+    mux.HandleFunc("/api/logs", logsHandler)
     mux.HandleFunc("/api/trigger-worker", triggerWorkerHandler)
+    mux.HandleFunc("/api/worker-status", workerStatusHandler)
     mux.HandleFunc("/api/ws", wsHandler)
     mux.HandleFunc("/api/health", func(w http.ResponseWriter, r *http.Request) {
         writeJSON(w, map[string]any{"status": "ok"})
@@ -310,13 +313,17 @@ func runWorker() {
                 log.Printf("scraper %s error: %v\n", s.Name(), err)
                 continue
             }
-            for _, r := range results {
+            log.Printf("Scraper %s returned %d results for item %q\n", s.Name(), len(results), it.Text)
+            for i, r := range results {
+                log.Printf("  Result %d: title=%q url=%s has_magnet=%v\n", i+1, r.Title, r.URL, r.MagnetLink != "")
                 // Check if we've reached the limit during result processing
                 if matchesFound >= maxMatchesPerItem {
                     break
                 }
+                
+                // Check quality FIRST before any other processing
                 if disqualifiedQuality(r.Title) {
-                    log.Printf("DISQUALIFIED_QUALITY site=%s url=%s title=%q\n", s.Name(), r.URL, r.Title)
+                    log.Printf("DISQUALIFIED_QUALITY site=%s url=%s title=%q - skipping\n", s.Name(), r.URL, r.Title)
                     continue
                 }
 
@@ -334,14 +341,42 @@ func runWorker() {
                 // Log the scraped torrent title before processing
                 log.Printf("Scraped from page: title=%q url=%s\n", r.Title, r.URL)
                 
+                // Pre-filter: Check if item text appears as contiguous phrase in result
+                // Normalize both strings and check if item words appear together in order
+                normalizedItem := normalize(removeYear(it.Text))
+                normalizedTitle := normalize(r.Title)
+                
+                // Check if the item appears as a contiguous phrase (allowing for extra chars like dots, dashes)
+                // Replace common separators with spaces for matching
+                titleForMatching := strings.ReplaceAll(normalizedTitle, ".", " ")
+                titleForMatching = strings.ReplaceAll(titleForMatching, "-", " ")
+                titleForMatching = strings.ReplaceAll(titleForMatching, "_", " ")
+                
+                itemForMatching := strings.ReplaceAll(normalizedItem, ".", " ")
+                itemForMatching = strings.ReplaceAll(itemForMatching, "-", " ")
+                itemForMatching = strings.ReplaceAll(itemForMatching, "_", " ")
+                
+                // Collapse multiple spaces
+                titleForMatching = strings.Join(strings.Fields(titleForMatching), " ")
+                itemForMatching = strings.Join(strings.Fields(itemForMatching), " ")
+                
+                if !strings.Contains(titleForMatching, itemForMatching) {
+                    log.Printf("PRE_FILTER_REJECTED: item phrase %q not found contiguously in title %q - skipping LLM\n", 
+                        itemForMatching, titleForMatching)
+                    continue
+                }
+                
+                log.Printf("PRE_FILTER_PASSED: item phrase %q found in title - proceeding to LLM\n", itemForMatching)
+                
                 // Extract entities from torrent title using LLM
-                var entitiesJSON []byte
+                var entitiesJSON []byte = []byte("[]") // Initialize to empty JSON array
                 var entities []Entity
                 useEntityMatching := strings.ToLower(os.Getenv("USE_ENTITY_MATCHING")) == "true"
                 
                 if useEntityMatching {
-                    log.Printf("Sending to LLM for entity extraction: %q\n", r.Title)
+                    log.Printf(">>> CALLING LLM for entity extraction: %q\n", r.Title)
                     entityResp, err := extractEntities(r.Title)
+                    log.Printf("<<< LLM CALL COMPLETED for %q (error: %v)\n", r.Title, err)
                     if err != nil {
                         log.Printf("Entity extraction failed for %q: %v\n", r.Title, err)
                         // Fall back to fuzzy matching if entity extraction fails
@@ -412,15 +447,26 @@ func runWorker() {
                     continue
                 }
 
-                inserted, err := insertMatchWithEntities(it.ID, r.Title, r.URL, s.Name(), r.Title, r.MagnetLink, entitiesJSON)
+                // Match confirmed! Now extract magnet link from detail page
+                log.Printf(">>> MATCH CONFIRMED for %q, extracting magnet link from %s\n", r.Title, r.URL)
+                magnetLink, err := extractMagnetLinkFromURL(pw, r.URL)
+                log.Printf("<<< MAGNET EXTRACTION COMPLETED for %s (error: %v)\n", r.URL, err)
+                if err != nil {
+                    log.Printf("Failed to extract magnet link from %s: %v\n", r.URL, err)
+                    // Continue anyway - save match without magnet link
+                    magnetLink = ""
+                }
+
+                log.Printf("Attempting to insert match with magnet_link=%q\n", magnetLink)
+                inserted, err := insertMatchWithEntities(it.ID, r.Title, r.URL, s.Name(), r.Title, magnetLink, entitiesJSON)
                 if err != nil {
                     log.Printf("insert match error: %v\n", err)
                     continue
                 }
                 if inserted {
                     matchesFound++
-                    log.Printf("MATCH site=%s item=%q title=%q url=%s (match %d/%d)\n",
-                        s.Name(), it.Text, r.Title, r.URL, matchesFound, maxMatchesPerItem)
+                    log.Printf("MATCH site=%s item=%q title=%q url=%s magnet=%q (match %d/%d)\n",
+                        s.Name(), it.Text, r.Title, r.URL, magnetLink, matchesFound, maxMatchesPerItem)
 
                     // Broadcast new match via WebSocket
                     broadcastNewMatch(map[string]any{
@@ -442,6 +488,22 @@ func runWorker() {
                     }
                 }
             }
+        }
+        
+        // Log completion of this item
+        success := matchesFound > 0
+        description := fmt.Sprintf("Item '%s' completed with %d match(es)", it.Text, matchesFound)
+        if err := insertLog(description, success); err != nil {
+            log.Printf("Failed to insert log for item %q: %v\n", it.Text, err)
+        } else {
+            log.Printf("LOG: %s (success=%v)\n", description, success)
+            
+            // Broadcast new log via WebSocket
+            broadcastNewLog(map[string]any{
+                "description": description,
+                "success":     success,
+                "timestamp":   time.Now().Format(time.RFC3339),
+            })
         }
     }
 
@@ -534,19 +596,41 @@ func fuzzyScore(query, candidate string) float64 {
     return math.Max(0, math.Min(1, score))
 }
 
-// disqualifiedQuality checks for TS/CAM tokens or "Telesync" substring (case-sensitive as requested)
+// disqualifiedQuality checks for TS/CAM/TELECINE/Soundtrack tokens or "Telesync" substring (case-sensitive as requested)
 func disqualifiedQuality(title string) bool {
-    // TS and CAM must be standalone tokens (case-sensitive)
+    // TS, CAM, TELECINE, and Soundtrack must be standalone tokens (case-sensitive)
     // e.g. "Movie TS 1080p" -> disqualify
-    tokens := strings.Fields(title)
-    for _, t := range tokens {
-        if t == "TS" || t == "CAM" {
-            return true
-        }
-    }
-    if strings.Contains(title, "Telesync") {
+    // e.g. "Movie.TELECINE.avi" -> disqualify
+    // e.g. "Movie (Original Motion Picture Soundtrack)" -> disqualify
+    
+    // Check for Soundtrack (case-insensitive)
+    if strings.Contains(strings.ToLower(title), "soundtrack") {
+        log.Printf("QUALITY_CHECK: Disqualified %q - contains 'soundtrack'\n", title)
         return true
     }
+    
+    // Check for Telesync
+    if strings.Contains(title, "Telesync") {
+        log.Printf("QUALITY_CHECK: Disqualified %q - contains 'Telesync'\n", title)
+        return true
+    }
+    
+    // Split by spaces first
+    tokens := strings.Fields(title)
+    for _, t := range tokens {
+        // Also check tokens split by dots/dashes/underscores
+        subTokens := strings.FieldsFunc(t, func(r rune) bool {
+            return r == '.' || r == '-' || r == '_'
+        })
+        for _, st := range subTokens {
+            stUpper := strings.ToUpper(st)
+            if stUpper == "TS" || stUpper == "CAM" || stUpper == "TELECINE" || stUpper == "HDCAM" || stUpper == "CAMRIP" {
+                log.Printf("QUALITY_CHECK: Disqualified %q - found token %q\n", title, st)
+                return true
+            }
+        }
+    }
+    
     return false
 }
 
@@ -701,34 +785,28 @@ func extractEntities(text string) (*EntityExtractionResponse, error) {
         ollamaModel = "llama2" // Default model
     }
 
-    prompt := `You are an information extraction system.
+    prompt := `Extract named entities from this torrent title and return ONLY a JSON object with an "entities" array. No explanations, no text, ONLY JSON.
 
-Task: Extract named entities from the TEXT below, Finding the entities in each line of the text.
-Return ONLY valid JSON matching this schema:
-
+Schema:
 {
   "entities": [
     {
       "text": "string",
-      "type": "FILM TITLE|YEAR|RESOLUTION|UPLOADER|VIDEO FORMAT|SIZE|SEEDERS|LEECHERS",
-      "start": 0,
-      "end": 0,
-      "confidence": 0.0
+      "type": "FILM TITLE|YEAR|RESOLUTION|VIDEO FORMAT",
+      "confidence": 0.95
     }
   ]
 }
 
-Rules:
-- Character offsets are 0-based and end-exclusive.
-- Do not include duplicates.
-- No commentary.
+Torrent title: ` + text + `
 
-TEXT: ` + text
+JSON output:`
 
     reqBody := OllamaRequest{
         Model:  ollamaModel,
         Prompt: prompt,
         Stream: false,
+        Format: "json", // Force JSON output
     }
 
     jsonData, err := json.Marshal(reqBody)
@@ -752,6 +830,13 @@ TEXT: ` + text
         return nil, fmt.Errorf("failed to decode Ollama response: %w", err)
     }
 
+    // Check if response is empty or whitespace-only
+    trimmedResponse := strings.TrimSpace(ollamaResp.Response)
+    if trimmedResponse == "" {
+        log.Printf("LLM returned empty response - treating as extraction failure")
+        return nil, fmt.Errorf("LLM returned empty response")
+    }
+
     // Parse the JSON response from the LLM
     // Try to parse as array first (LLM sometimes returns array directly)
     var entities []Entity
@@ -763,8 +848,8 @@ TEXT: ` + text
     // Try to parse as object with "entities" field
     var entityResp EntityExtractionResponse
     if err := json.Unmarshal([]byte(ollamaResp.Response), &entityResp); err != nil {
-        log.Printf("Failed to parse entity extraction response: %v\nResponse: %s", err, ollamaResp.Response)
-        return nil, fmt.Errorf("failed to parse entity extraction: %w", err)
+        log.Printf("LLM returned invalid JSON - treating as extraction failure\nError: %v\nResponse: %q", err, ollamaResp.Response)
+        return nil, fmt.Errorf("LLM returned invalid JSON: %w", err)
     }
 
     return &entityResp, nil
@@ -798,6 +883,14 @@ func insertMatchWithEntities(itemID int64, matchedText, matchedURL, sourceSite, 
     }
     n, _ := res.RowsAffected()
     return n > 0, nil
+}
+
+func insertLog(description string, success bool) error {
+    _, err := db.Exec(`
+        INSERT INTO logs(description, success)
+        VALUES ($1, $2)
+    `, description, success)
+    return err
 }
 
 // -------------------- Twilio (optional) --------------------
@@ -846,7 +939,7 @@ func maybeSendTwilioSMS(itemText, matchedTitle, matchedURL, site string) error {
 func itemsHandler(w http.ResponseWriter, r *http.Request) {
     switch r.Method {
     case http.MethodGet:
-        rows, err := db.Query(`SELECT id, text FROM items ORDER BY id DESC`)
+        rows, err := db.Query(`SELECT id, text FROM items ORDER BY created_at DESC`)
         if err != nil {
             http.Error(w, err.Error(), http.StatusInternalServerError)
             return
@@ -874,6 +967,21 @@ func itemsHandler(w http.ResponseWriter, r *http.Request) {
             http.Error(w, "text required", http.StatusBadRequest)
             return
         }
+        
+        // Check if item already exists
+        var existingID int64
+        err := db.QueryRow(`SELECT id FROM items WHERE text = $1`, text).Scan(&existingID)
+        if err == nil {
+            // Item already exists
+            w.WriteHeader(http.StatusConflict)
+            writeJSON(w, map[string]any{"error": "Item already exists"})
+            return
+        } else if err != sql.ErrNoRows {
+            // Database error
+            http.Error(w, err.Error(), http.StatusInternalServerError)
+            return
+        }
+        
         res, err := db.Exec(`INSERT INTO items(text) VALUES ($1)`, text)
         if err != nil {
             http.Error(w, err.Error(), http.StatusInternalServerError)
@@ -1102,6 +1210,71 @@ func matchesHandler(w http.ResponseWriter, r *http.Request) {
     writeJSON(w, out)
 }
 
+func logsHandler(w http.ResponseWriter, r *http.Request) {
+    if r.Method != http.MethodGet {
+        w.WriteHeader(http.StatusMethodNotAllowed)
+        return
+    }
+
+    // Parse pagination parameters
+    pageStr := r.URL.Query().Get("page")
+    page := 1
+    if pageStr != "" {
+        if p, err := strconv.Atoi(pageStr); err == nil && p > 0 {
+            page = p
+        }
+    }
+    
+    pageSize := 25
+    offset := (page - 1) * pageSize
+
+    // Get total count
+    var total int
+    err := db.QueryRow(`SELECT COUNT(*) FROM logs`).Scan(&total)
+    if err != nil {
+        http.Error(w, err.Error(), http.StatusInternalServerError)
+        return
+    }
+
+    // Get paginated logs
+    rows, err := db.Query(`
+        SELECT id, timestamp, description, success
+        FROM logs
+        ORDER BY timestamp DESC
+        LIMIT $1 OFFSET $2
+    `, pageSize, offset)
+    if err != nil {
+        http.Error(w, err.Error(), http.StatusInternalServerError)
+        return
+    }
+    defer rows.Close()
+
+    type Log struct {
+        ID          int64  `json:"id"`
+        Timestamp   string `json:"timestamp"`
+        Description string `json:"description"`
+        Success     bool   `json:"success"`
+    }
+    
+    logs := make([]Log, 0, pageSize)
+    for rows.Next() {
+        var l Log
+        if err := rows.Scan(&l.ID, &l.Timestamp, &l.Description, &l.Success); err != nil {
+            http.Error(w, err.Error(), http.StatusInternalServerError)
+            return
+        }
+        logs = append(logs, l)
+    }
+    
+    writeJSON(w, map[string]any{
+        "logs":       logs,
+        "page":       page,
+        "page_size":  pageSize,
+        "total":      total,
+        "total_pages": (total + pageSize - 1) / pageSize,
+    })
+}
+
 func matchHandler(w http.ResponseWriter, r *http.Request) {
     if r.Method != http.MethodDelete {
         w.WriteHeader(http.StatusMethodNotAllowed)
@@ -1109,19 +1282,37 @@ func matchHandler(w http.ResponseWriter, r *http.Request) {
     }
 
     idStr := strings.TrimPrefix(r.URL.Path, "/api/matches/")
+    log.Printf("DELETE /api/matches/%s - Attempting to delete match ID: %s\n", idStr, idStr)
+    
     id, err := strconv.ParseInt(idStr, 10, 64)
     if err != nil {
+        log.Printf("DELETE /api/matches/%s - Invalid ID format: %v\n", idStr, err)
         http.Error(w, "Invalid match ID", http.StatusBadRequest)
         return
     }
 
-    _, err = db.Exec("DELETE FROM matches WHERE id=$1", id)
+    result, err := db.Exec("DELETE FROM matches WHERE id=$1", id)
     if err != nil {
+        log.Printf("DELETE /api/matches/%d - Database error: %v\n", id, err)
         http.Error(w, err.Error(), http.StatusInternalServerError)
         return
     }
+    
+    rowsAffected, _ := result.RowsAffected()
+    log.Printf("DELETE /api/matches/%d - Successfully deleted %d row(s)\n", id, rowsAffected)
 
     writeJSON(w, map[string]any{"ok": true})
+}
+
+func workerStatusHandler(w http.ResponseWriter, r *http.Request) {
+    if r.Method != http.MethodGet {
+        w.WriteHeader(http.StatusMethodNotAllowed)
+        return
+    }
+
+    writeJSON(w, map[string]any{
+        "running": workerRunning.Load(),
+    })
 }
 
 func triggerWorkerHandler(w http.ResponseWriter, r *http.Request) {
@@ -1220,6 +1411,24 @@ func broadcastNewMatch(match map[string]any) {
     }
 }
 
+func broadcastNewLog(logEntry map[string]any) {
+    wsClientsMux.Lock()
+    defer wsClientsMux.Unlock()
+    
+    msg := map[string]any{
+        "type": "new_log",
+        "log":  logEntry,
+    }
+    
+    for client := range wsClients {
+        if err := client.WriteJSON(msg); err != nil {
+            log.Printf("WebSocket write error: %v", err)
+            client.Close()
+            delete(wsClients, client)
+        }
+    }
+}
+
 func writeJSON(w http.ResponseWriter, v any) {
     w.Header().Set("Content-Type", "application/json")
     enc := json.NewEncoder(w)
@@ -1269,6 +1478,13 @@ func initDB(db *sql.DB) error {
             config JSONB,
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
             updated_at TIMESTAMP
+        );`,
+
+        `CREATE TABLE IF NOT EXISTS logs (
+            id SERIAL PRIMARY KEY,
+            timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            description TEXT NOT NULL,
+            success BOOLEAN NOT NULL
         );`,
 
         // Add config column if it doesn't exist (for existing tables)
@@ -1522,9 +1738,15 @@ func (s *GenericScraper) Search(ctx context.Context, pw *playwright.Playwright, 
         return nil, err
     }
 
-    results := []SearchResult{}
+    // First pass: Extract all link data from search results page (cache it)
+    type LinkData struct {
+        Href string
+        Text string
+    }
+    var linkDataList []LinkData
     seen := make(map[string]bool)
 
+    log.Printf("Extracting link data from search results page...\n")
     for _, link := range links {
         href, err := link.GetAttribute("href")
         if err != nil || href == "" {
@@ -1551,11 +1773,6 @@ func (s *GenericScraper) Search(ctx context.Context, pw *playwright.Playwright, 
             continue
         }
 
-        // Skip if we've seen this URL
-        if seen[href] {
-            continue
-        }
-
         // Make sure href is absolute
         if !strings.HasPrefix(href, "http") {
             if strings.HasPrefix(href, "/") {
@@ -1566,73 +1783,111 @@ func (s *GenericScraper) Search(ctx context.Context, pw *playwright.Playwright, 
             }
         }
 
-        // If we have extraction steps, follow them to get the actual torrent URL
-        torrentURL := href
-        if len(extractionSteps) > 0 {
-            extractedURL, err := s.extractTorrentURL(browser, href, extractionSteps)
-            if err != nil {
-                log.Printf("Failed to extract torrent URL from %s: %v\n", href, err)
-                continue
-            }
-            if extractedURL != "" {
-                torrentURL = extractedURL
-            }
+        // Validate URL can be parsed
+        parsedURL, err := url.Parse(href)
+        if err != nil {
+            log.Printf("Skipping malformed URL for %q: %v\n", text, err)
+            continue
         }
-
-        // Try to find magnet link
-        magnetLink := ""
         
-        // First, check if the current link itself is a magnet link
-        if strings.HasPrefix(href, "magnet:") {
-            magnetLink = href
-        } else {
-            // For LimeTorrents and similar sites, need to navigate to detail page
-            // Try to extract magnet link by clicking through to the detail page
-            detailPage, err := browser.NewPage()
-            if err == nil {
-                defer detailPage.Close()
-                
-                // Navigate to the torrent detail page
-                if _, err := detailPage.Goto(href, playwright.PageGotoOptions{
-                    WaitUntil: playwright.WaitUntilStateNetworkidle,
-                    Timeout:   playwright.Float(10000),
-                }); err == nil {
-                    // Look for link with text "Magnet Link" or href starting with "magnet:"
-                    magnetLocator := detailPage.Locator("a:has-text('Magnet Link'), a:has-text('Magnet Download'), a[href^='magnet:']").First()
-                    if magnetHref, err := magnetLocator.GetAttribute("href"); err == nil && magnetHref != "" {
-                        magnetLink = magnetHref
-                        log.Printf("Extracted magnet link from detail page: %s\n", href)
-                    }
-                }
-            }
-            
-            // Fallback: Try to find magnet link in parent or nearby elements on search results page
-            if magnetLink == "" {
-                parent := link.Locator("xpath=ancestor::tr | ancestor::div[@class='tt-name'] | ancestor::*[contains(@class, 'torrent')]").First()
-                if parent != nil {
-                    magnetLocator := parent.Locator("a[href^='magnet:']").First()
-                    if magnetHref, err := magnetLocator.GetAttribute("href"); err == nil && magnetHref != "" {
-                        magnetLink = magnetHref
-                    }
-                }
-            }
-        }
+        // Use the parsed URL's string representation (properly encoded)
+        href = parsedURL.String()
 
-        seen[torrentURL] = true
+        // Skip if we've seen this URL
+        if seen[href] {
+            continue
+        }
+        
+        log.Printf("Cached link: title=%q url=%s\n", text, href)
+        seen[href] = true
+        linkDataList = append(linkDataList, LinkData{Href: href, Text: text})
+    }
+    
+    log.Printf("Cached %d links from search results page (will process until matches found)\n", len(linkDataList))
+
+    // Second pass: Process cached links and extract magnet links from detail pages
+    results := []SearchResult{}
+    
+    // Just return cached search results WITHOUT magnet links
+    // Worker will extract magnet links only for confirmed matches
+    for _, linkData := range linkDataList {
         results = append(results, SearchResult{
-            Title:      text,
-            URL:        torrentURL,
-            MagnetLink: magnetLink,
+            Title:      linkData.Text,
+            URL:        linkData.Href,
+            MagnetLink: "", // Will be extracted later for matches only
         })
-
-        // Limit results to avoid too much data
-        if len(results) >= 50 {
-            break
-        }
     }
 
     log.Printf("Found %d potential results from %s\n", len(results), s.URL)
     return results, nil
+}
+
+// extractMagnetLink extracts magnet link from a torrent detail page
+func extractMagnetLinkFromURL(pw *playwright.Playwright, detailURL string) (string, error) {
+    if pw == nil {
+        return "", fmt.Errorf("playwright not available")
+    }
+
+    // Parse and properly encode the URL to handle non-ASCII characters
+    parsedURL, err := url.Parse(detailURL)
+    if err != nil {
+        log.Printf("Failed to parse URL %q: %v\n", detailURL, err)
+        return "", fmt.Errorf("invalid URL: %v", err)
+    }
+    
+    // Get the properly encoded URL string
+    encodedURL := parsedURL.String()
+    log.Printf("Navigating to detail page (encoded): %s\n", encodedURL)
+
+    browser, err := pw.Chromium.Launch(playwright.BrowserTypeLaunchOptions{
+        Headless: playwright.Bool(true),
+    })
+    if err != nil {
+        return "", err
+    }
+    defer browser.Close()
+
+    page, err := browser.NewPage()
+    if err != nil {
+        return "", err
+    }
+    defer page.Close()
+
+    // Navigate to detail page using encoded URL
+    if _, err := page.Goto(encodedURL, playwright.PageGotoOptions{
+        WaitUntil: playwright.WaitUntilStateNetworkidle,
+        Timeout:   playwright.Float(10000),
+    }); err != nil {
+        return "", fmt.Errorf("navigation failed: %v", err)
+    }
+
+    // Save screenshot and HTML for debugging
+    timestamp := time.Now().Unix()
+    screenshotPath := fmt.Sprintf("data/screenshots/magnet_%s_%d.png", url.QueryEscape(detailURL), timestamp)
+    htmlPath := fmt.Sprintf("data/html/magnet_%s_%d.html", url.QueryEscape(detailURL), timestamp)
+    
+    os.MkdirAll("data/screenshots", 0755)
+    os.MkdirAll("data/html", 0755)
+    
+    page.Screenshot(playwright.PageScreenshotOptions{
+        Path: playwright.String(screenshotPath),
+        FullPage: playwright.Bool(true),
+    })
+    
+    htmlContent, _ := page.Content()
+    os.WriteFile(htmlPath, []byte(htmlContent), 0644)
+    
+    log.Printf("Saved magnet extraction debug files: %s, %s\n", screenshotPath, htmlPath)
+
+    // Look for magnet link
+    magnetLocator := page.Locator("a:has-text('Magnet Link'), a:has-text('Magnet Download'), a[href^='magnet:']").First()
+    magnetLink, err := magnetLocator.GetAttribute("href")
+    if err != nil || magnetLink == "" {
+        return "", fmt.Errorf("magnet link not found")
+    }
+
+    log.Printf("Extracted magnet link from %s: %s\n", detailURL, magnetLink)
+    return magnetLink, nil
 }
 
 // extractTorrentURL follows config-driven steps to extract the actual torrent URL
