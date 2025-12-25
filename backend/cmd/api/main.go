@@ -1,32 +1,36 @@
 package main
 
 import (
-    "context"
-    "database/sql"
-    "encoding/json"
-    "errors"
-    "fmt"
-    "log"
-    "math"
-    "net/http"
-    "net/url"
-    "os"
-    "os/signal"
-    "regexp"
-    "strconv"
-    "strings"
-    "sync/atomic"
-    "syscall"
-    "time"
+	"bytes"
+	"context"
+	"database/sql"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"log"
+	"math"
+	"net/http"
+	"net/url"
+	"os"
+	"os/exec"
+	"os/signal"
+	"regexp"
+	"strconv"
+	"strings"
+	"sync/atomic"
+	"syscall"
+	"time"
 
-    "github.com/lithammer/fuzzysearch/fuzzy"
-    _ "github.com/mattn/go-sqlite3"
-    "github.com/playwright-community/playwright-go"
+	_ "github.com/lib/pq"
+	"github.com/lithammer/fuzzysearch/fuzzy"
+	"github.com/playwright-community/playwright-go"
 )
 
 var (
     db            *sql.DB
     workerRunning atomic.Bool
+    ollamaCmd     *exec.Cmd
 )
 
 type Item struct {
@@ -34,9 +38,38 @@ type Item struct {
     Text string `json:"text"`
 }
 
+type URL struct {
+    ID          int64  `json:"id"`
+    URL         string `json:"url"`
+    DisplayName string `json:"display_name,omitempty"`
+    Config      string `json:"config,omitempty"` // JSON string for scraper config
+}
+
 type SearchResult struct {
     Title string
     URL   string
+}
+
+type Entity struct {
+    Text       string  `json:"text"`
+    Type       string  `json:"type"`
+    Start      int     `json:"start"`
+    End        int     `json:"end"`
+    Confidence float64 `json:"confidence"`
+}
+
+type EntityExtractionResponse struct {
+    Entities []Entity `json:"entities"`
+}
+
+type OllamaRequest struct {
+    Model  string `json:"model"`
+    Prompt string `json:"prompt"`
+    Stream bool   `json:"stream"`
+}
+
+type OllamaResponse struct {
+    Response string `json:"response"`
 }
 
 type SiteScraper interface {
@@ -45,9 +78,9 @@ type SiteScraper interface {
 }
 
 func main() {
-    dbPath := os.Getenv("DB_PATH")
-    if dbPath == "" {
-        log.Fatal("DB_PATH not set (e.g. /data/app.db)")
+    dbURL := os.Getenv("DATABASE_URL")
+    if dbURL == "" {
+        log.Fatal("DATABASE_URL not set (e.g. postgres://user:password@localhost:5432/dbname?sslmode=disable)")
     }
 
     intervalHours := getenvInt("CHECK_INTERVAL_HOURS", 6)
@@ -58,11 +91,11 @@ func main() {
 
     runOnStart := strings.ToLower(os.Getenv("RUN_WORKER_ON_START"))
     if runOnStart == "" {
-        runOnStart = "true"
+        runOnStart = "false"
     }
 
     var err error
-    db, err = sql.Open("sqlite3", dbPath)
+    db, err = sql.Open("postgres", dbURL)
     if err != nil {
         log.Fatal(err)
     }
@@ -70,12 +103,45 @@ func main() {
         log.Fatal(err)
     }
 
+    // Check Ollama availability if entity matching is enabled
+    useEntityMatching := strings.ToLower(os.Getenv("USE_ENTITY_MATCHING")) == "true"
+    if useEntityMatching {
+        log.Println("Entity matching enabled, starting Ollama if needed...")
+        
+        // Try to start Ollama if it's not running
+        if err := startOllama(); err != nil {
+            log.Printf("WARNING: Failed to start Ollama: %v", err)
+            log.Println("Entity extraction will be skipped. To fix:")
+            log.Println("  1. Manually start Ollama: ollama serve")
+            log.Println("  2. Pull the model: ollama pull " + os.Getenv("OLLAMA_MODEL"))
+            log.Println("  3. Or disable entity matching: USE_ENTITY_MATCHING=false")
+        } else {
+            // Now check health and initialize the model
+            if err := checkOllamaHealth(); err != nil {
+                log.Printf("WARNING: Ollama health check failed: %v", err)
+                log.Println("Entity extraction will be skipped.")
+            } else {
+                ollamaModel := os.Getenv("OLLAMA_MODEL")
+                if ollamaModel == "" {
+                    ollamaModel = "llama2"
+                }
+                log.Println("========================================")
+                log.Printf("✓ OLLAMA MODEL %q IS RUNNING AND READY", strings.ToUpper(ollamaModel))
+                log.Println("✓ Entity extraction is enabled and operational")
+                log.Println("========================================")
+            }
+        }
+    }
+
     go scheduler(interval, runOnStart == "true")
 
     mux := http.NewServeMux()
     mux.HandleFunc("/api/items", itemsHandler)
     mux.HandleFunc("/api/items/", itemHandler)
+    mux.HandleFunc("/api/urls", urlsHandler)
+    mux.HandleFunc("/api/urls/", urlHandler)
     mux.HandleFunc("/api/matches", matchesHandler)
+    mux.HandleFunc("/api/trigger-worker", triggerWorkerHandler)
     mux.HandleFunc("/api/health", func(w http.ResponseWriter, r *http.Request) {
         writeJSON(w, map[string]any{"status": "ok"})
     })
@@ -98,6 +164,17 @@ func main() {
 
     <-ctx.Done()
     log.Println("Shutting down...")
+    
+    // Stop Ollama if we started it
+    if ollamaCmd != nil && ollamaCmd.Process != nil {
+        log.Println("Stopping Ollama server...")
+        if err := ollamaCmd.Process.Kill(); err != nil {
+            log.Printf("Failed to stop Ollama: %v", err)
+        } else {
+            log.Println("Ollama server stopped")
+        }
+    }
+    
     shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
     defer cancel()
     _ = server.Shutdown(shutdownCtx)
@@ -166,8 +243,23 @@ func runWorker() {
         return
     }
 
-    scrapers := []SiteScraper{
-        &ExampleComScraper{},
+    urls, err := loadUrls()
+    if err != nil {
+        log.Println("worker load urls:", err)
+        return
+    }
+    if len(urls) == 0 {
+        log.Println("worker: no urls; done")
+        return
+    }
+
+    scrapers := []SiteScraper{}
+    for _, u := range urls {
+        displayName := u.DisplayName
+        if displayName == "" {
+            displayName = u.URL
+        }
+        scrapers = append(scrapers, &GenericScraper{URL: u.URL, DisplayName: displayName, Config: u.Config})
     }
 
     var pw *playwright.Playwright
@@ -199,19 +291,105 @@ func runWorker() {
                     continue
                 }
 
-                score := fuzzyScore(it.Text, r.Title)
-                if score < threshold {
+                // Extract year from item text
+                itemYear := extractYear(it.Text)
+                itemWithoutYear := removeYear(it.Text)
+                
+                // Log item year extraction
+                if itemYear != "" {
+                    log.Printf("Item year extracted: %q has year=%s (without year: %q)\n", it.Text, itemYear, itemWithoutYear)
+                } else {
+                    log.Printf("Item has no year: %q\n", it.Text)
+                }
+                
+                // Log the scraped torrent title before processing
+                log.Printf("Scraped from page: title=%q url=%s\n", r.Title, r.URL)
+                
+                // Extract entities from torrent title using LLM
+                var entitiesJSON []byte
+                var entities []Entity
+                useEntityMatching := strings.ToLower(os.Getenv("USE_ENTITY_MATCHING")) == "true"
+                
+                if useEntityMatching {
+                    log.Printf("Sending to LLM for entity extraction: %q\n", r.Title)
+                    entityResp, err := extractEntities(r.Title)
+                    if err != nil {
+                        log.Printf("Entity extraction failed for %q: %v\n", r.Title, err)
+                        // Fall back to fuzzy matching if entity extraction fails
+                    } else {
+                        entities = entityResp.Entities
+                        entitiesJSON, _ = json.Marshal(entities)
+                        log.Printf("Extracted %d entities from %q (URL: %s):\n", len(entities), r.Title, r.URL)
+                        for i, entity := range entities {
+                            log.Printf("  [%d] Type: %-20s Text: %-30s Confidence: %.2f\n", 
+                                i+1, entity.Type, entity.Text, entity.Confidence)
+                        }
+                    }
+                }
+
+                // Determine what to compare based on entity extraction
+                var matched bool
+                
+                if useEntityMatching && len(entities) > 0 {
+                    // Entity-based matching
+                    filmTitleEntity := findEntityByType(entities, "FILM TITLE")
+                    yearEntity := findEntityByType(entities, "YEAR")
+                    
+                    if filmTitleEntity != nil {
+                        // Compare item (without year) against FILM TITLE entity - EXACT MATCH REQUIRED
+                        itemTitleLower := strings.ToLower(strings.TrimSpace(itemWithoutYear))
+                        filmTitleLower := strings.ToLower(strings.TrimSpace(filmTitleEntity.Text))
+                        exactMatch := itemTitleLower == filmTitleLower
+                        
+                        log.Printf("EXACT_MATCH_CHECK item=%q (no year: %q) filmTitle=%q match=%v\n", 
+                            it.Text, itemWithoutYear, filmTitleEntity.Text, exactMatch)
+                        
+                        if exactMatch {
+                            // If item has a year, verify it matches
+                            if itemYear != "" {
+                                if yearEntity != nil && yearEntity.Text == itemYear {
+                                    matched = true
+                                    log.Printf("YEAR_MATCH item_year=%s entity_year=%s\n", itemYear, yearEntity.Text)
+                                } else if yearEntity != nil {
+                                    log.Printf("YEAR_MISMATCH item_year=%s entity_year=%s - REJECTED\n", itemYear, yearEntity.Text)
+                                    continue
+                                } else {
+                                    log.Printf("NO_YEAR_ENTITY item_year=%s - REJECTED\n", itemYear)
+                                    continue
+                                }
+                            } else {
+                                // No year in item, just match on title
+                                matched = true
+                            }
+                        } else {
+                            log.Printf("TITLE_MISMATCH item=%q filmTitle=%q - REJECTED\n", itemWithoutYear, filmTitleEntity.Text)
+                        }
+                    } else {
+                        log.Printf("NO_FILM_TITLE_ENTITY for %q - falling back to fuzzy\n", r.Title)
+                    }
+                }
+                
+                // Fall back to simple fuzzy matching if entity matching didn't work
+                if !matched {
+                    score := fuzzyScore(it.Text, r.Title)
+                    log.Printf("FUZZY_SCORE=%.2f (threshold=%.2f) item=%q title=%q\n", score, threshold, it.Text, r.Title)
+                    if score >= threshold {
+                        matched = true
+                    }
+                }
+                
+                if !matched {
                     continue
                 }
 
-                inserted, err := insertMatchDedup(it.ID, r.Title, r.URL, s.Name())
+                inserted, err := insertMatchWithEntities(it.ID, r.Title, r.URL, s.Name(), r.Title, entitiesJSON)
                 if err != nil {
                     log.Printf("insert match error: %v\n", err)
                     continue
                 }
                 if inserted {
-                    log.Printf("MATCH site=%s score=%.2f item=%q title=%q url=%s\n",
-                        s.Name(), score, it.Text, r.Title, r.URL)
+                    log.Printf("MATCH site=%s item=%q title=%q url=%s\n",
+                        s.Name(), it.Text, r.Title, r.URL)
 
                     if err := maybeSendTwilioSMS(it.Text, r.Title, r.URL, s.Name()); err != nil {
                         log.Printf("twilio sms error: %v\n", err)
@@ -238,6 +416,24 @@ func loadItems() ([]Item, error) {
             return nil, err
         }
         out = append(out, it)
+    }
+    return out, nil
+}
+
+func loadUrls() ([]URL, error) {
+    rows, err := db.Query(`SELECT id, url, COALESCE(display_name, ''), COALESCE(config::text, '') FROM urls ORDER BY id ASC`)
+    if err != nil {
+        return nil, err
+    }
+    defer rows.Close()
+
+    out := make([]URL, 0, 64)
+    for rows.Next() {
+        var u URL
+        if err := rows.Scan(&u.ID, &u.URL, &u.DisplayName, &u.Config); err != nil {
+            return nil, err
+        }
+        out = append(out, u)
     }
     return out, nil
 }
@@ -308,14 +504,249 @@ func disqualifiedQuality(title string) bool {
     return false
 }
 
+// -------------------- Entity Extraction with Ollama --------------------
+
+func extractYear(text string) string {
+    // Match 4-digit year (1900-2099)
+    re := regexp.MustCompile(`\b(19\d{2}|20\d{2})\b`)
+    matches := re.FindStringSubmatch(text)
+    if len(matches) > 0 {
+        return matches[0]
+    }
+    return ""
+}
+
+func removeYear(text string) string {
+    // Remove 4-digit year and surrounding whitespace
+    re := regexp.MustCompile(`\s*(19\d{2}|20\d{2})\s*`)
+    return strings.TrimSpace(re.ReplaceAllString(text, " "))
+}
+
+func findEntityByType(entities []Entity, entityType string) *Entity {
+    for _, e := range entities {
+        if strings.Contains(strings.ToUpper(e.Type), entityType) {
+            return &e
+        }
+    }
+    return nil
+}
+
+func startOllama() error {
+    ollamaURL := os.Getenv("OLLAMA_URL")
+    if ollamaURL == "" {
+        ollamaURL = "http://localhost:11434"
+    }
+    
+    // Check if Ollama is already running
+    resp, err := http.Get(ollamaURL + "/api/tags")
+    if err == nil {
+        resp.Body.Close()
+        log.Println("Ollama is already running")
+        return nil
+    }
+    
+    // Ollama is not running, start it
+    log.Println("Starting Ollama server...")
+    ollamaCmd = exec.Command("ollama", "serve")
+    
+    // Start the process in the background
+    if err := ollamaCmd.Start(); err != nil {
+        return fmt.Errorf("failed to start Ollama: %w", err)
+    }
+    
+    log.Printf("Ollama server started with PID %d", ollamaCmd.Process.Pid)
+    
+    // Wait for Ollama to be ready (max 30 seconds)
+    for i := 0; i < 30; i++ {
+        time.Sleep(1 * time.Second)
+        resp, err := http.Get(ollamaURL + "/api/tags")
+        if err == nil {
+            resp.Body.Close()
+            log.Println("Ollama server is ready")
+            return nil
+        }
+    }
+    
+    return fmt.Errorf("Ollama server did not become ready within 30 seconds")
+}
+
+func checkOllamaHealth() error {
+    ollamaURL := os.Getenv("OLLAMA_URL")
+    if ollamaURL == "" {
+        ollamaURL = "http://localhost:11434"
+    }
+    
+    // Check if Ollama is running
+    resp, err := http.Get(ollamaURL + "/api/tags")
+    if err != nil {
+        return fmt.Errorf("Ollama is not running at %s: %w", ollamaURL, err)
+    }
+    defer resp.Body.Close()
+    
+    if resp.StatusCode != http.StatusOK {
+        return fmt.Errorf("Ollama returned status %d", resp.StatusCode)
+    }
+    
+    // Check if the specified model is available
+    ollamaModel := os.Getenv("OLLAMA_MODEL")
+    if ollamaModel == "" {
+        ollamaModel = "llama2"
+    }
+    
+    var result struct {
+        Models []struct {
+            Name string `json:"name"`
+        } `json:"models"`
+    }
+    
+    if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+        return fmt.Errorf("failed to decode Ollama models list: %w", err)
+    }
+    
+    modelFound := false
+    for _, m := range result.Models {
+        if strings.HasPrefix(m.Name, ollamaModel) {
+            modelFound = true
+            break
+        }
+    }
+    
+    if !modelFound {
+        return fmt.Errorf("model %q not found in Ollama. Run: ollama pull %s", ollamaModel, ollamaModel)
+    }
+    
+    // Initialize the model by making a test generation call
+    // This loads the model into memory if it's not already loaded
+    log.Printf("Initializing model %q...", ollamaModel)
+    testReq := OllamaRequest{
+        Model:  ollamaModel,
+        Prompt: "Hello",
+        Stream: false,
+    }
+    
+    jsonData, err := json.Marshal(testReq)
+    if err != nil {
+        return fmt.Errorf("failed to marshal test request: %w", err)
+    }
+    
+    testResp, err := http.Post(ollamaURL+"/api/generate", "application/json", bytes.NewBuffer(jsonData))
+    if err != nil {
+        return fmt.Errorf("failed to initialize model: %w", err)
+    }
+    defer testResp.Body.Close()
+    
+    if testResp.StatusCode != http.StatusOK {
+        body, _ := io.ReadAll(testResp.Body)
+        return fmt.Errorf("model initialization failed with status %d: %s", testResp.StatusCode, string(body))
+    }
+    
+    log.Printf("Model %q initialized successfully", ollamaModel)
+    return nil
+}
+
+func extractEntities(text string) (*EntityExtractionResponse, error) {
+    ollamaURL := os.Getenv("OLLAMA_URL")
+    if ollamaURL == "" {
+        ollamaURL = "http://localhost:11434" // Default Ollama URL
+    }
+    
+    ollamaModel := os.Getenv("OLLAMA_MODEL")
+    if ollamaModel == "" {
+        ollamaModel = "llama2" // Default model
+    }
+
+    prompt := `You are an information extraction system.
+
+Task: Extract named entities from the TEXT below, Finding the entities in each line of the text.
+Return ONLY valid JSON matching this schema:
+
+{
+  "entities": [
+    {
+      "text": "string",
+      "type": "FILM TITLE|YEAR|RESOLUTION|UPLOADER|VIDEO FORMAT|SIZE|SEEDERS|LEECHERS",
+      "start": 0,
+      "end": 0,
+      "confidence": 0.0
+    }
+  ]
+}
+
+Rules:
+- Character offsets are 0-based and end-exclusive.
+- Do not include duplicates.
+- No commentary.
+
+TEXT: ` + text
+
+    reqBody := OllamaRequest{
+        Model:  ollamaModel,
+        Prompt: prompt,
+        Stream: false,
+    }
+
+    jsonData, err := json.Marshal(reqBody)
+    if err != nil {
+        return nil, fmt.Errorf("failed to marshal request: %w", err)
+    }
+
+    resp, err := http.Post(ollamaURL+"/api/generate", "application/json", bytes.NewBuffer(jsonData))
+    if err != nil {
+        return nil, fmt.Errorf("failed to call Ollama: %w", err)
+    }
+    defer resp.Body.Close()
+
+    if resp.StatusCode != http.StatusOK {
+        body, _ := io.ReadAll(resp.Body)
+        return nil, fmt.Errorf("Ollama returned status %d: %s", resp.StatusCode, string(body))
+    }
+
+    var ollamaResp OllamaResponse
+    if err := json.NewDecoder(resp.Body).Decode(&ollamaResp); err != nil {
+        return nil, fmt.Errorf("failed to decode Ollama response: %w", err)
+    }
+
+    // Parse the JSON response from the LLM
+    // Try to parse as array first (LLM sometimes returns array directly)
+    var entities []Entity
+    if err := json.Unmarshal([]byte(ollamaResp.Response), &entities); err == nil {
+        // Successfully parsed as array
+        return &EntityExtractionResponse{Entities: entities}, nil
+    }
+    
+    // Try to parse as object with "entities" field
+    var entityResp EntityExtractionResponse
+    if err := json.Unmarshal([]byte(ollamaResp.Response), &entityResp); err != nil {
+        log.Printf("Failed to parse entity extraction response: %v\nResponse: %s", err, ollamaResp.Response)
+        return nil, fmt.Errorf("failed to parse entity extraction: %w", err)
+    }
+
+    return &entityResp, nil
+}
+
 // -------------------- DB inserts + dedupe --------------------
 
-func insertMatchDedup(itemID int64, matchedText, matchedURL, sourceSite string) (bool, error) {
-    // INSERT OR IGNORE provides dedupe via unique index (item_id, matched_url, source_site)
+func insertMatchDedup(itemID int64, matchedText, matchedURL, sourceSite, torrentText string) (bool, error) {
+    // ON CONFLICT DO NOTHING provides dedupe via unique index (item_id, matched_url, source_site)
     res, err := db.Exec(`
-        INSERT OR IGNORE INTO matches(item_id, matched_text, matched_url, source_site)
-        VALUES (?, ?, ?, ?)
-    `, itemID, matchedText, matchedURL, sourceSite)
+        INSERT INTO matches(item_id, matched_text, matched_url, source_site, torrent_text)
+        VALUES ($1, $2, $3, $4, $5)
+        ON CONFLICT (item_id, matched_url, source_site) DO NOTHING
+    `, itemID, matchedText, matchedURL, sourceSite, torrentText)
+    if err != nil {
+        return false, err
+    }
+    n, _ := res.RowsAffected()
+    return n > 0, nil
+}
+
+func insertMatchWithEntities(itemID int64, matchedText, matchedURL, sourceSite, torrentText string, entitiesJSON []byte) (bool, error) {
+    // ON CONFLICT DO NOTHING provides dedupe via unique index (item_id, matched_url, source_site)
+    res, err := db.Exec(`
+        INSERT INTO matches(item_id, matched_text, matched_url, source_site, torrent_text, entities)
+        VALUES ($1, $2, $3, $4, $5, $6)
+        ON CONFLICT (item_id, matched_url, source_site) DO NOTHING
+    `, itemID, matchedText, matchedURL, sourceSite, torrentText, entitiesJSON)
     if err != nil {
         return false, err
     }
@@ -397,7 +828,7 @@ func itemsHandler(w http.ResponseWriter, r *http.Request) {
             http.Error(w, "text required", http.StatusBadRequest)
             return
         }
-        res, err := db.Exec(`INSERT INTO items(text) VALUES (?)`, text)
+        res, err := db.Exec(`INSERT INTO items(text) VALUES ($1)`, text)
         if err != nil {
             http.Error(w, err.Error(), http.StatusInternalServerError)
             return
@@ -431,7 +862,7 @@ func itemHandler(w http.ResponseWriter, r *http.Request) {
             http.Error(w, "text required", http.StatusBadRequest)
             return
         }
-        _, err := db.Exec(`UPDATE items SET text=?, updated_at=CURRENT_TIMESTAMP WHERE id=?`, text, id)
+        _, err := db.Exec(`UPDATE items SET text=$1, updated_at=CURRENT_TIMESTAMP WHERE id=$2`, text, id)
         if err != nil {
             http.Error(w, err.Error(), http.StatusInternalServerError)
             return
@@ -439,7 +870,135 @@ func itemHandler(w http.ResponseWriter, r *http.Request) {
         writeJSON(w, map[string]any{"ok": true})
 
     case http.MethodDelete:
-        _, err := db.Exec(`DELETE FROM items WHERE id=?`, id)
+        _, err := db.Exec(`DELETE FROM items WHERE id=$1`, id)
+        if err != nil {
+            http.Error(w, err.Error(), http.StatusInternalServerError)
+            return
+        }
+        writeJSON(w, map[string]any{"ok": true})
+
+    default:
+        w.WriteHeader(http.StatusMethodNotAllowed)
+    }
+}
+
+func urlsHandler(w http.ResponseWriter, r *http.Request) {
+    switch r.Method {
+    case http.MethodGet:
+        rows, err := db.Query(`SELECT id, url, COALESCE(display_name, ''), COALESCE(config::text, '') FROM urls ORDER BY id DESC`)
+        if err != nil {
+            http.Error(w, err.Error(), http.StatusInternalServerError)
+            return
+        }
+        defer rows.Close()
+
+        out := make([]URL, 0, 64)
+        for rows.Next() {
+            var u URL
+            if err := rows.Scan(&u.ID, &u.URL, &u.DisplayName, &u.Config); err != nil {
+                http.Error(w, err.Error(), http.StatusInternalServerError)
+                return
+            }
+            out = append(out, u)
+        }
+        writeJSON(w, out)
+
+    case http.MethodPost:
+        if err := r.ParseForm(); err != nil {
+            http.Error(w, "invalid form", http.StatusBadRequest)
+            return
+        }
+        urlStr := strings.TrimSpace(r.FormValue("url"))
+        if urlStr == "" {
+            http.Error(w, "url required", http.StatusBadRequest)
+            return
+        }
+        displayName := strings.TrimSpace(r.FormValue("display_name"))
+        configStr := strings.TrimSpace(r.FormValue("config"))
+        var res sql.Result
+        var err error
+        
+        if configStr != "" && displayName != "" {
+            res, err = db.Exec(`INSERT INTO urls(url, display_name, config) VALUES ($1, $2, $3::jsonb)`, urlStr, displayName, configStr)
+        } else if configStr != "" {
+            res, err = db.Exec(`INSERT INTO urls(url, config) VALUES ($1, $2::jsonb)`, urlStr, configStr)
+        } else if displayName != "" {
+            res, err = db.Exec(`INSERT INTO urls(url, display_name) VALUES ($1, $2)`, urlStr, displayName)
+        } else {
+            res, err = db.Exec(`INSERT INTO urls(url) VALUES ($1)`, urlStr)
+        }
+        if err != nil {
+            http.Error(w, err.Error(), http.StatusInternalServerError)
+            return
+        }
+        id, _ := res.LastInsertId()
+        w.WriteHeader(http.StatusCreated)
+        writeJSON(w, map[string]any{"id": id})
+
+    default:
+        w.WriteHeader(http.StatusMethodNotAllowed)
+    }
+}
+
+func urlHandler(w http.ResponseWriter, r *http.Request) {
+    idStr := strings.TrimPrefix(r.URL.Path, "/api/urls/")
+    idStr = strings.Trim(idStr, "/")
+    id, err := strconv.ParseInt(idStr, 10, 64)
+    if err != nil || id <= 0 {
+        http.Error(w, "invalid id", http.StatusBadRequest)
+        return
+    }
+
+    switch r.Method {
+    case http.MethodPut:
+        if err := r.ParseForm(); err != nil {
+            http.Error(w, "invalid form", http.StatusBadRequest)
+            return
+        }
+        urlStr := strings.TrimSpace(r.FormValue("url"))
+        displayName := strings.TrimSpace(r.FormValue("display_name"))
+        configStr := strings.TrimSpace(r.FormValue("config"))
+        
+        if urlStr == "" && displayName == "" && configStr == "" {
+            http.Error(w, "url, display_name, or config required", http.StatusBadRequest)
+            return
+        }
+        
+        // Build dynamic update query
+        updates := []string{}
+        args := []interface{}{}
+        argPos := 1
+        
+        if urlStr != "" {
+            updates = append(updates, fmt.Sprintf("url=$%d", argPos))
+            args = append(args, urlStr)
+            argPos++
+        }
+        if displayName != "" {
+            updates = append(updates, fmt.Sprintf("display_name=$%d", argPos))
+            args = append(args, displayName)
+            argPos++
+        }
+        if configStr != "" {
+            updates = append(updates, fmt.Sprintf("config=$%d::jsonb", argPos))
+            args = append(args, configStr)
+            argPos++
+        }
+        
+        updates = append(updates, "updated_at=CURRENT_TIMESTAMP")
+        args = append(args, id)
+        
+        query := fmt.Sprintf("UPDATE urls SET %s WHERE id=$%d", strings.Join(updates, ", "), argPos)
+        _, err = db.Exec(query, args...)
+        
+        if err != nil {
+            http.Error(w, err.Error(), http.StatusInternalServerError)
+            return
+        }
+        writeJSON(w, map[string]any{"ok": true})
+
+    case http.MethodDelete:
+        _, err := db.Exec(`DELETE FROM urls WHERE id=$1`, id)
         if err != nil {
             http.Error(w, err.Error(), http.StatusInternalServerError)
             return
@@ -452,13 +1011,19 @@ func itemHandler(w http.ResponseWriter, r *http.Request) {
 }
 
 func matchesHandler(w http.ResponseWriter, r *http.Request) {
+    if r.URL.RawQuery != "" {
+        log.Printf("GET /api/matches - Query params: %s", r.URL.RawQuery)
+    } else {
+        log.Printf("GET /api/matches - No query params")
+    }
+    
     if r.Method != http.MethodGet {
         w.WriteHeader(http.StatusMethodNotAllowed)
         return
     }
 
     rows, err := db.Query(`
-        SELECT m.id, i.text, m.matched_url, m.source_site, m.created_at
+        SELECT m.id, i.text, m.matched_url, m.source_site, COALESCE(m.torrent_text, ''), m.created_at
         FROM matches m
         JOIN items i ON i.id = m.item_id
         ORDER BY m.created_at DESC
@@ -471,22 +1036,51 @@ func matchesHandler(w http.ResponseWriter, r *http.Request) {
     defer rows.Close()
 
     type Match struct {
-        ID      int64  `json:"id"`
-        Item    string `json:"item"`
-        URL     string `json:"url"`
-        Site    string `json:"site"`
-        Created string `json:"created"`
+        ID          int64  `json:"id"`
+        Item        string `json:"item"`
+        URL         string `json:"url"`
+        Site        string `json:"site"`
+        TorrentText string `json:"torrent_text,omitempty"`
+        Created     string `json:"created"`
     }
     out := make([]Match, 0, 200)
     for rows.Next() {
         var m Match
-        if err := rows.Scan(&m.ID, &m.Item, &m.URL, &m.Site, &m.Created); err != nil {
+        if err := rows.Scan(&m.ID, &m.Item, &m.URL, &m.Site, &m.TorrentText, &m.Created); err != nil {
             http.Error(w, err.Error(), http.StatusInternalServerError)
             return
         }
         out = append(out, m)
     }
     writeJSON(w, out)
+}
+
+func triggerWorkerHandler(w http.ResponseWriter, r *http.Request) {
+    if r.URL.RawQuery != "" {
+        log.Printf("POST /api/trigger-worker - Query params: %s", r.URL.RawQuery)
+    } else {
+        log.Printf("POST /api/trigger-worker - No query params")
+    }
+    
+    if r.Method != http.MethodPost {
+        w.WriteHeader(http.StatusMethodNotAllowed)
+        return
+    }
+
+    if workerRunning.Load() {
+        writeJSON(w, map[string]any{
+            "status":  "already_running",
+            "message": "Worker is already running",
+        })
+        return
+    }
+
+    go runWorker()
+
+    writeJSON(w, map[string]any{
+        "status":  "triggered",
+        "message": "Worker triggered successfully",
+    })
 }
 
 func writeJSON(w http.ResponseWriter, v any) {
@@ -508,28 +1102,95 @@ func loggingMiddleware(next http.Handler) http.Handler {
 
 func initDB(db *sql.DB) error {
     stmts := []string{
-        `PRAGMA journal_mode = WAL;`,
-        `PRAGMA busy_timeout = 5000;`,
-
         `CREATE TABLE IF NOT EXISTS items (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            id SERIAL PRIMARY KEY,
             text TEXT NOT NULL,
-            created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-            updated_at DATETIME
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            updated_at TIMESTAMP
         );`,
 
         `CREATE TABLE IF NOT EXISTS matches (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            id SERIAL PRIMARY KEY,
             item_id INTEGER NOT NULL,
             matched_text TEXT,
             matched_url TEXT NOT NULL,
             source_site TEXT NOT NULL,
-            created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-            FOREIGN KEY (item_id) REFERENCES items(id)
+            torrent_text VARCHAR(500),
+            entities JSONB,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY (item_id) REFERENCES items(id) ON DELETE CASCADE
         );`,
 
         `CREATE UNIQUE INDEX IF NOT EXISTS ux_matches_dedupe
          ON matches(item_id, matched_url, source_site);`,
+
+        `CREATE TABLE IF NOT EXISTS urls (
+            id SERIAL PRIMARY KEY,
+            url TEXT NOT NULL UNIQUE,
+            display_name TEXT,
+            config JSONB,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            updated_at TIMESTAMP
+        );`,
+
+        // Add config column if it doesn't exist (for existing tables)
+        `DO $$ 
+        BEGIN 
+            IF NOT EXISTS (
+                SELECT 1 FROM information_schema.columns 
+                WHERE table_name='urls' AND column_name='config'
+            ) THEN
+                ALTER TABLE urls ADD COLUMN config JSONB;
+            END IF;
+        END $$;`,
+
+        // Add display_name column if it doesn't exist (for existing tables)
+        `DO $$ 
+        BEGIN 
+            IF NOT EXISTS (
+                SELECT 1 FROM information_schema.columns 
+                WHERE table_name='urls' AND column_name='display_name'
+            ) THEN
+                ALTER TABLE urls ADD COLUMN display_name TEXT;
+            END IF;
+        END $$;`,
+
+        // Add torrent_text column if it doesn't exist (for existing tables)
+        `DO $$ 
+        BEGIN 
+            IF NOT EXISTS (
+                SELECT 1 FROM information_schema.columns 
+                WHERE table_name='matches' AND column_name='torrent_text'
+            ) THEN
+                ALTER TABLE matches ADD COLUMN torrent_text VARCHAR(500);
+            END IF;
+        END $$;`,
+
+        // Add entities column if it doesn't exist (for existing tables)
+        `DO $$ 
+        BEGIN 
+            IF NOT EXISTS (
+                SELECT 1 FROM information_schema.columns 
+                WHERE table_name='matches' AND column_name='entities'
+            ) THEN
+                ALTER TABLE matches ADD COLUMN entities JSONB;
+            END IF;
+        END $$;`,
+
+        // Update foreign key constraint to include ON DELETE CASCADE
+        `DO $$ 
+        BEGIN 
+            -- Drop the old constraint if it exists
+            IF EXISTS (
+                SELECT 1 FROM information_schema.table_constraints 
+                WHERE constraint_name = 'matches_item_id_fkey' 
+                AND table_name = 'matches'
+            ) THEN
+                ALTER TABLE matches DROP CONSTRAINT matches_item_id_fkey;
+                ALTER TABLE matches ADD CONSTRAINT matches_item_id_fkey 
+                    FOREIGN KEY (item_id) REFERENCES items(id) ON DELETE CASCADE;
+            END IF;
+        END $$;`,
     }
 
     for _, s := range stmts {
@@ -538,6 +1199,367 @@ func initDB(db *sql.DB) error {
         }
     }
     return nil
+}
+
+// -------------------- Generic URL scraper --------------------
+
+type GenericScraper struct {
+    URL         string
+    DisplayName string
+    Config      string // JSON config with selectors
+}
+
+func (s *GenericScraper) Name() string { return s.DisplayName }
+
+func (s *GenericScraper) Search(ctx context.Context, pw *playwright.Playwright, query string) ([]SearchResult, error) {
+    // If Playwright is disabled, just return no results.
+    if pw == nil {
+        return nil, nil
+    }
+
+    browser, err := pw.Chromium.Launch(playwright.BrowserTypeLaunchOptions{
+        Headless: playwright.Bool(true),
+    })
+    if err != nil {
+        return nil, err
+    }
+    defer func() { _ = browser.Close() }()
+
+    page, err := browser.NewPage()
+    if err != nil {
+        return nil, err
+    }
+    defer func() { _ = page.Close() }()
+
+    log.Printf("Navigating to %s to search for %q\n", s.URL, query)
+
+    // Navigate to the base URL first
+    if _, err := page.Goto(s.URL, playwright.PageGotoOptions{
+        WaitUntil: playwright.WaitUntilStateNetworkidle,
+        Timeout:   playwright.Float(30000),
+    }); err != nil {
+        return nil, err
+    }
+
+    // Parse config for search box and button selectors
+    var config map[string]interface{}
+    searchInputSelector := "input[type='search'], input[name='q'], input[name='query'], input[name='search']"
+    searchButtonSelector := "button[type='submit'], input[type='submit'], button:has-text('Search')"
+    
+    if s.Config != "" {
+        if err := json.Unmarshal([]byte(s.Config), &config); err != nil {
+            log.Printf("Failed to parse config: %v\n", err)
+        } else {
+            if sel, ok := config["searchInputSelector"].(string); ok && sel != "" {
+                searchInputSelector = sel
+            }
+            if sel, ok := config["searchButtonSelector"].(string); ok && sel != "" {
+                searchButtonSelector = sel
+            }
+        }
+    }
+
+    log.Printf("Looking for search input with selector: %s\n", searchInputSelector)
+    
+    // Find and fill the search input
+    searchInput := page.Locator(searchInputSelector).First()
+    if err := searchInput.WaitFor(playwright.LocatorWaitForOptions{
+        State:   playwright.WaitForSelectorStateVisible,
+        Timeout: playwright.Float(10000),
+    }); err != nil {
+        log.Printf("Could not find search input: %v\n", err)
+        return nil, fmt.Errorf("search input not found")
+    }
+
+    if err := searchInput.Fill(query); err != nil {
+        log.Printf("Failed to fill search input: %v\n", err)
+        return nil, err
+    }
+
+    log.Printf("Filled search input, looking for search button: %s\n", searchButtonSelector)
+
+    // Click the search button with timeout
+    searchButton := page.Locator(searchButtonSelector).First()
+    
+    // Wait for button to be visible with timeout
+    if err := searchButton.WaitFor(playwright.LocatorWaitForOptions{
+        State:   playwright.WaitForSelectorStateVisible,
+        Timeout: playwright.Float(5000),
+    }); err != nil {
+        log.Printf("Search button not found, trying Enter key: %v\n", err)
+        if err := searchInput.Press("Enter"); err != nil {
+            log.Printf("Failed to press Enter: %v\n", err)
+            return nil, fmt.Errorf("could not submit search")
+        }
+    } else {
+        if err := searchButton.Click(playwright.LocatorClickOptions{
+            Timeout: playwright.Float(5000),
+        }); err != nil {
+            log.Printf("Failed to click search button, trying Enter: %v\n", err)
+            if err := searchInput.Press("Enter"); err != nil {
+                log.Printf("Failed to press Enter: %v\n", err)
+                return nil, fmt.Errorf("could not submit search")
+            }
+        }
+    }
+
+    log.Printf("Search submitted, waiting for navigation and results...\n")
+
+    // Wait for navigation/results to load with shorter timeout
+    time.Sleep(2 * time.Second) // Give page time to start loading
+    if err := page.WaitForLoadState(playwright.PageWaitForLoadStateOptions{
+        State:   playwright.LoadStateNetworkidle,
+        Timeout: playwright.Float(15000),
+    }); err != nil {
+        log.Printf("Warning: page load state timeout: %v (continuing anyway)\n", err)
+        // Continue anyway, results might be loaded
+    }
+
+    // Log the current URL to confirm navigation
+    currentURL := page.URL()
+    log.Printf("Search completed, now on page: %s\n", currentURL)
+
+    // Save screenshot and HTML for debugging/config creation
+    timestamp := time.Now().Unix()
+    screenshotPath := fmt.Sprintf("data/screenshots/%s_%d.png", url.QueryEscape(s.URL), timestamp)
+    htmlPath := fmt.Sprintf("data/html/%s_%d.html", url.QueryEscape(s.URL), timestamp)
+    
+    // Create directories if they don't exist
+    os.MkdirAll("data/screenshots", 0755)
+    os.MkdirAll("data/html", 0755)
+    
+    // Save screenshot
+    if _, err := page.Screenshot(playwright.PageScreenshotOptions{
+        Path: playwright.String(screenshotPath),
+        FullPage: playwright.Bool(true),
+    }); err != nil {
+        log.Printf("Failed to save screenshot: %v\n", err)
+    } else {
+        log.Printf("Saved screenshot: %s\n", screenshotPath)
+    }
+    
+    // Save HTML
+    htmlContent, err := page.Content()
+    if err != nil {
+        log.Printf("Failed to get page content: %v\n", err)
+    } else {
+        if err := os.WriteFile(htmlPath, []byte(htmlContent), 0644); err != nil {
+            log.Printf("Failed to save HTML: %v\n", err)
+        } else {
+            log.Printf("Saved HTML: %s\n", htmlPath)
+        }
+    }
+
+    // Parse config for link selector and extraction sequence
+    var linkSelector string = "a" // default
+    var extractionSteps []interface{}
+    
+    if s.Config != "" && config != nil {
+        // Check if config has a link selector
+        if sel, ok := config["linkSelector"].(string); ok && sel != "" {
+            linkSelector = sel
+            log.Printf("Using custom link selector: %s\n", linkSelector)
+        }
+        // Check if config has extraction steps
+        if steps, ok := config["extractionSteps"].([]interface{}); ok {
+            extractionSteps = steps
+            log.Printf("Using %d extraction steps from config\n", len(extractionSteps))
+        }
+    }
+
+    // Try to find torrent links using config selector or default
+    links, err := page.Locator(linkSelector).All()
+    if err != nil {
+        return nil, err
+    }
+
+    results := []SearchResult{}
+    seen := make(map[string]bool)
+
+    for _, link := range links {
+        href, err := link.GetAttribute("href")
+        if err != nil || href == "" {
+            continue
+        }
+
+        text, err := link.InnerText()
+        if err != nil || text == "" {
+            continue
+        }
+
+        text = strings.TrimSpace(text)
+        
+        // Skip navigation/short links - torrent titles are usually longer
+        if len(text) < 10 {
+            continue
+        }
+
+        // Skip common navigation text
+        lowerText := strings.ToLower(text)
+        if lowerText == "home" || lowerText == "login" || lowerText == "register" || 
+           lowerText == "about" || lowerText == "contact" || lowerText == "privacy" ||
+           lowerText == "terms of service" || lowerText == "dmca" || strings.HasPrefix(lowerText, "page ") {
+            continue
+        }
+
+        // Skip if we've seen this URL
+        if seen[href] {
+            continue
+        }
+
+        // Make sure href is absolute
+        if !strings.HasPrefix(href, "http") {
+            if strings.HasPrefix(href, "/") {
+                parsedBase, _ := url.Parse(s.URL)
+                href = parsedBase.Scheme + "://" + parsedBase.Host + href
+            } else {
+                continue
+            }
+        }
+
+        // If we have extraction steps, follow them to get the actual torrent URL
+        torrentURL := href
+        if len(extractionSteps) > 0 {
+            extractedURL, err := s.extractTorrentURL(browser, href, extractionSteps)
+            if err != nil {
+                log.Printf("Failed to extract torrent URL from %s: %v\n", href, err)
+                continue
+            }
+            if extractedURL != "" {
+                torrentURL = extractedURL
+            }
+        }
+
+        seen[torrentURL] = true
+        results = append(results, SearchResult{
+            Title: text,
+            URL:   torrentURL,
+        })
+
+        // Limit results to avoid too much data
+        if len(results) >= 50 {
+            break
+        }
+    }
+
+    log.Printf("Found %d potential results from %s\n", len(results), s.URL)
+    return results, nil
+}
+
+// extractTorrentURL follows config-driven steps to extract the actual torrent URL
+func (s *GenericScraper) extractTorrentURL(browser playwright.Browser, startURL string, steps []interface{}) (string, error) {
+    page, err := browser.NewPage()
+    if err != nil {
+        return "", err
+    }
+    defer func() { _ = page.Close() }()
+
+    currentURL := startURL
+    log.Printf("Starting extraction from %s\n", startURL)
+
+    // Navigate to the initial URL
+    if _, err := page.Goto(currentURL, playwright.PageGotoOptions{
+        WaitUntil: playwright.WaitUntilStateNetworkidle,
+        Timeout:   playwright.Float(15000),
+    }); err != nil {
+        return "", fmt.Errorf("failed to navigate to %s: %w", currentURL, err)
+    }
+
+    // Execute each step in sequence
+    for i, stepInterface := range steps {
+        stepMap, ok := stepInterface.(map[string]interface{})
+        if !ok {
+            log.Printf("Step %d: invalid step format\n", i)
+            continue
+        }
+
+        action, _ := stepMap["action"].(string)
+        selector, _ := stepMap["selector"].(string)
+        attribute, _ := stepMap["attribute"].(string)
+
+        log.Printf("Step %d: action=%s selector=%s\n", i, action, selector)
+
+        switch action {
+        case "click":
+            // Click on an element
+            elem := page.Locator(selector).First()
+            if err := elem.WaitFor(playwright.LocatorWaitForOptions{
+                State:   playwright.WaitForSelectorStateVisible,
+                Timeout: playwright.Float(10000),
+            }); err != nil {
+                return "", fmt.Errorf("step %d: element not found: %s", i, selector)
+            }
+            
+            if err := elem.Click(); err != nil {
+                return "", fmt.Errorf("step %d: click failed: %w", i, err)
+            }
+
+            // Wait for navigation if needed
+            time.Sleep(1 * time.Second)
+            if err := page.WaitForLoadState(playwright.PageWaitForLoadStateOptions{
+                State:   playwright.LoadStateNetworkidle,
+                Timeout: playwright.Float(10000),
+            }); err != nil {
+                log.Printf("Step %d: load state timeout (continuing anyway)\n", i)
+            }
+
+        case "clickNewPage":
+            // Click on an element that opens a new page/tab
+            elem := page.Locator(selector).First()
+            if err := elem.WaitFor(playwright.LocatorWaitForOptions{
+                State:   playwright.WaitForSelectorStateVisible,
+                Timeout: playwright.Float(10000),
+            }); err != nil {
+                return "", fmt.Errorf("step %d: element not found: %s", i, selector)
+            }
+
+            // Listen for new page
+            newPage, err := page.Context().ExpectPage(func() error {
+                return elem.Click()
+            })
+            
+            if err != nil {
+                return "", fmt.Errorf("step %d: failed to open new page: %w", i, err)
+            }
+
+            // Switch to new page
+            _ = page.Close()
+            page = newPage
+            
+            if err := page.WaitForLoadState(playwright.PageWaitForLoadStateOptions{
+                State:   playwright.LoadStateNetworkidle,
+                Timeout: playwright.Float(10000),
+            }); err != nil {
+                log.Printf("Step %d: new page load timeout (continuing anyway)\n", i)
+            }
+
+        case "extract":
+            // Extract attribute from an element
+            elem := page.Locator(selector).First()
+            if err := elem.WaitFor(playwright.LocatorWaitForOptions{
+                State:   playwright.WaitForSelectorStateVisible,
+                Timeout: playwright.Float(10000),
+            }); err != nil {
+                return "", fmt.Errorf("step %d: element not found: %s", i, selector)
+            }
+
+            var extractedValue string
+            if attribute == "text" {
+                extractedValue, err = elem.InnerText()
+            } else {
+                extractedValue, err = elem.GetAttribute(attribute)
+            }
+            
+            if err != nil || extractedValue == "" {
+                return "", fmt.Errorf("step %d: failed to extract %s", i, attribute)
+            }
+
+            log.Printf("Extracted torrent URL: %s\n", extractedValue)
+            return extractedValue, nil
+        }
+    }
+
+    return "", fmt.Errorf("no extraction step found in config")
 }
 
 // -------------------- Example.com scraper --------------------
