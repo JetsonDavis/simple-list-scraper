@@ -2,7 +2,7 @@ import { useEffect, useState } from "react";
 
 type Item = { id: number; text: string };
 type URL = { id: number; url: string; display_name?: string; config?: string };
-type Match = { id: number; item: string; url: string; site: string; torrent_text?: string; created: string };
+type Match = { id: number; item: string; url: string; site: string; torrent_text?: string; magnet_link?: string; created: string };
 
 export default function App() {
   const [tab, setTab] = useState<"items" | "urls" | "matches">(() => {
@@ -350,12 +350,13 @@ export default function App() {
           <table className="table">
             <thead>
               <tr>
-                <th style={{ width: '20%' }}>Item</th>
-                <th style={{ width: '10%' }}>Site</th>
-                <th style={{ width: '30%' }}>Torrent Text</th>
-                <th>URL</th>
-                <th style={{ width: '180px' }}>When</th>
-                <th style={{ width: '80px', textAlign: 'center' }}>Action</th>
+                <th style={{ width: '15%' }}>Item</th>
+                <th style={{ width: '8%' }}>Site</th>
+                <th style={{ width: '25%' }}>Torrent Text</th>
+                <th style={{ width: '30%' }}>URL</th>
+                <th style={{ width: '60px', textAlign: 'center' }}>Magnet</th>
+                <th style={{ width: '140px' }}>When</th>
+                <th style={{ width: '60px', textAlign: 'center' }}>Action</th>
               </tr>
             </thead>
             <tbody>
@@ -365,6 +366,28 @@ export default function App() {
                   <td>{m.site}</td>
                   <td>{m.torrent_text || ''}</td>
                   <td><a href={m.url} target="_blank" rel="noreferrer">{m.url}</a></td>
+                  <td style={{ textAlign: 'center' }}>
+                    {m.magnet_link ? (
+                      <a href={m.magnet_link} title="Open magnet link">
+                        <svg 
+                          width="18" 
+                          height="18" 
+                          viewBox="0 0 24 24" 
+                          fill="none" 
+                          stroke="#0078D4" 
+                          strokeWidth="2" 
+                          strokeLinecap="round" 
+                          strokeLinejoin="round"
+                        >
+                          <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"></path>
+                          <polyline points="7 10 12 15 17 10"></polyline>
+                          <line x1="12" y1="15" x2="12" y2="3"></line>
+                        </svg>
+                      </a>
+                    ) : (
+                      <span style={{ color: '#999' }}>-</span>
+                    )}
+                  </td>
                   <td>{m.created}</td>
                   <td style={{ textAlign: 'center' }}>
                     <button 

@@ -55,8 +55,9 @@ type URL struct {
 }
 
 type SearchResult struct {
-    Title string
-    URL   string
+    Title      string
+    URL        string
+    MagnetLink string
 }
 
 type Entity struct {
@@ -294,13 +295,26 @@ func runWorker() {
     }
 
     for _, it := range items {
+        matchesFound := 0
+        maxMatchesPerItem := 5
+        
         for _, s := range scrapers {
+            // Check if we've already found enough matches for this item
+            if matchesFound >= maxMatchesPerItem {
+                log.Printf("Found %d matches for item %q, moving to next item\n", matchesFound, it.Text)
+                break
+            }
+            
             results, err := s.Search(context.Background(), pw, it.Text)
             if err != nil {
                 log.Printf("scraper %s error: %v\n", s.Name(), err)
                 continue
             }
             for _, r := range results {
+                // Check if we've reached the limit during result processing
+                if matchesFound >= maxMatchesPerItem {
+                    break
+                }
                 if disqualifiedQuality(r.Title) {
                     log.Printf("DISQUALIFIED_QUALITY site=%s url=%s title=%q\n", s.Name(), r.URL, r.Title)
                     continue
@@ -378,6 +392,7 @@ func runWorker() {
                             }
                         } else {
                             log.Printf("TITLE_MISMATCH item=%q filmTitle=%q - REJECTED\n", itemWithoutYear, filmTitleEntity.Text)
+                            continue // Skip fuzzy matching when entity matching explicitly rejects
                         }
                     } else {
                         log.Printf("NO_FILM_TITLE_ENTITY for %q - falling back to fuzzy\n", r.Title)
@@ -397,14 +412,15 @@ func runWorker() {
                     continue
                 }
 
-                inserted, err := insertMatchWithEntities(it.ID, r.Title, r.URL, s.Name(), r.Title, entitiesJSON)
+                inserted, err := insertMatchWithEntities(it.ID, r.Title, r.URL, s.Name(), r.Title, r.MagnetLink, entitiesJSON)
                 if err != nil {
                     log.Printf("insert match error: %v\n", err)
                     continue
                 }
                 if inserted {
-                    log.Printf("MATCH site=%s item=%q title=%q url=%s\n",
-                        s.Name(), it.Text, r.Title, r.URL)
+                    matchesFound++
+                    log.Printf("MATCH site=%s item=%q title=%q url=%s (match %d/%d)\n",
+                        s.Name(), it.Text, r.Title, r.URL, matchesFound, maxMatchesPerItem)
 
                     // Broadcast new match via WebSocket
                     broadcastNewMatch(map[string]any{
@@ -417,6 +433,12 @@ func runWorker() {
 
                     if err := maybeSendTwilioSMS(it.Text, r.Title, r.URL, s.Name()); err != nil {
                         log.Printf("twilio sms error: %v\n", err)
+                    }
+                    
+                    // Check if we've reached the limit after inserting
+                    if matchesFound >= maxMatchesPerItem {
+                        log.Printf("Reached %d matches for item %q, moving to next item\n", matchesFound, it.Text)
+                        break
                     }
                 }
             }
@@ -764,13 +786,13 @@ func insertMatchDedup(itemID int64, matchedText, matchedURL, sourceSite, torrent
     return n > 0, nil
 }
 
-func insertMatchWithEntities(itemID int64, matchedText, matchedURL, sourceSite, torrentText string, entitiesJSON []byte) (bool, error) {
+func insertMatchWithEntities(itemID int64, matchedText, matchedURL, sourceSite, torrentText, magnetLink string, entitiesJSON []byte) (bool, error) {
     // ON CONFLICT DO NOTHING provides dedupe via unique index (item_id, matched_url, source_site)
     res, err := db.Exec(`
-        INSERT INTO matches(item_id, matched_text, matched_url, source_site, torrent_text, entities)
-        VALUES ($1, $2, $3, $4, $5, $6)
+        INSERT INTO matches(item_id, matched_text, matched_url, source_site, torrent_text, magnet_link, entities)
+        VALUES ($1, $2, $3, $4, $5, $6, $7)
         ON CONFLICT (item_id, matched_url, source_site) DO NOTHING
-    `, itemID, matchedText, matchedURL, sourceSite, torrentText, entitiesJSON)
+    `, itemID, matchedText, matchedURL, sourceSite, torrentText, magnetLink, entitiesJSON)
     if err != nil {
         return false, err
     }
@@ -1047,7 +1069,7 @@ func matchesHandler(w http.ResponseWriter, r *http.Request) {
     }
 
     rows, err := db.Query(`
-        SELECT m.id, i.text, m.matched_url, m.source_site, COALESCE(m.torrent_text, ''), m.created_at
+        SELECT m.id, i.text, m.matched_url, m.source_site, COALESCE(m.torrent_text, ''), COALESCE(m.magnet_link, ''), m.created_at
         FROM matches m
         JOIN items i ON i.id = m.item_id
         ORDER BY m.created_at DESC
@@ -1065,12 +1087,13 @@ func matchesHandler(w http.ResponseWriter, r *http.Request) {
         URL         string `json:"url"`
         Site        string `json:"site"`
         TorrentText string `json:"torrent_text,omitempty"`
+        MagnetLink  string `json:"magnet_link,omitempty"`
         Created     string `json:"created"`
     }
     out := make([]Match, 0, 200)
     for rows.Next() {
         var m Match
-        if err := rows.Scan(&m.ID, &m.Item, &m.URL, &m.Site, &m.TorrentText, &m.Created); err != nil {
+        if err := rows.Scan(&m.ID, &m.Item, &m.URL, &m.Site, &m.TorrentText, &m.MagnetLink, &m.Created); err != nil {
             http.Error(w, err.Error(), http.StatusInternalServerError)
             return
         }
@@ -1230,6 +1253,7 @@ func initDB(db *sql.DB) error {
             matched_url TEXT NOT NULL,
             source_site TEXT NOT NULL,
             torrent_text VARCHAR(500),
+            magnet_link TEXT,
             entities JSONB,
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
             FOREIGN KEY (item_id) REFERENCES items(id) ON DELETE CASCADE
@@ -1288,6 +1312,17 @@ func initDB(db *sql.DB) error {
                 WHERE table_name='matches' AND column_name='entities'
             ) THEN
                 ALTER TABLE matches ADD COLUMN entities JSONB;
+            END IF;
+        END $$;`,
+
+        // Add magnet_link column if it doesn't exist
+        `DO $$ 
+        BEGIN 
+            IF NOT EXISTS (
+                SELECT 1 FROM information_schema.columns 
+                WHERE table_name = 'matches' AND column_name = 'magnet_link'
+            ) THEN
+                ALTER TABLE matches ADD COLUMN magnet_link TEXT;
             END IF;
         END $$;`,
 
@@ -1544,10 +1579,50 @@ func (s *GenericScraper) Search(ctx context.Context, pw *playwright.Playwright, 
             }
         }
 
+        // Try to find magnet link
+        magnetLink := ""
+        
+        // First, check if the current link itself is a magnet link
+        if strings.HasPrefix(href, "magnet:") {
+            magnetLink = href
+        } else {
+            // For LimeTorrents and similar sites, need to navigate to detail page
+            // Try to extract magnet link by clicking through to the detail page
+            detailPage, err := browser.NewPage()
+            if err == nil {
+                defer detailPage.Close()
+                
+                // Navigate to the torrent detail page
+                if _, err := detailPage.Goto(href, playwright.PageGotoOptions{
+                    WaitUntil: playwright.WaitUntilStateNetworkidle,
+                    Timeout:   playwright.Float(10000),
+                }); err == nil {
+                    // Look for link with text "Magnet Link" or href starting with "magnet:"
+                    magnetLocator := detailPage.Locator("a:has-text('Magnet Link'), a:has-text('Magnet Download'), a[href^='magnet:']").First()
+                    if magnetHref, err := magnetLocator.GetAttribute("href"); err == nil && magnetHref != "" {
+                        magnetLink = magnetHref
+                        log.Printf("Extracted magnet link from detail page: %s\n", href)
+                    }
+                }
+            }
+            
+            // Fallback: Try to find magnet link in parent or nearby elements on search results page
+            if magnetLink == "" {
+                parent := link.Locator("xpath=ancestor::tr | ancestor::div[@class='tt-name'] | ancestor::*[contains(@class, 'torrent')]").First()
+                if parent != nil {
+                    magnetLocator := parent.Locator("a[href^='magnet:']").First()
+                    if magnetHref, err := magnetLocator.GetAttribute("href"); err == nil && magnetHref != "" {
+                        magnetLink = magnetHref
+                    }
+                }
+            }
+        }
+
         seen[torrentURL] = true
         results = append(results, SearchResult{
-            Title: text,
-            URL:   torrentURL,
+            Title:      text,
+            URL:        torrentURL,
+            MagnetLink: magnetLink,
         })
 
         // Limit results to avoid too much data
