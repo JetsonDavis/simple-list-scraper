@@ -106,7 +106,7 @@ export default function App() {
 
     websocket.onmessage = (event) => {
       const data = JSON.parse(event.data);
-      
+
       if (data.type === 'worker_status') {
         console.log('Worker status:', data.status, data.message);
         if (data.status === 'running') {
@@ -201,7 +201,6 @@ export default function App() {
 
   async function removeMatch(id: number) {
     console.log("removeMatch called with ID:", id);
-    if (!confirm("Delete this match?")) return;
     try {
       const url = `/api/matches/${id}`;
       console.log("Sending DELETE request to:", url);
@@ -251,11 +250,28 @@ export default function App() {
     await loadUrls();
   }
 
+  async function clearLogs() {
+    if (!confirm("Delete all logs? This cannot be undone.")) return;
+    try {
+      const res = await fetch("/api/logs", { method: "DELETE" });
+      if (!res.ok) {
+        alert("Failed to clear logs");
+        return;
+      }
+      setLogs([]);
+      setLogsPage(1);
+      setLogsTotalPages(0);
+    } catch (err) {
+      console.error("Error clearing logs:", err);
+      alert("Failed to clear logs");
+    }
+  }
+
   async function triggerWorker() {
     try {
       const res = await fetch("/api/trigger-worker", { method: "POST" });
       const data = await res.json();
-      
+
       if (data.status === "already_running") {
         alert("Worker is already running");
       } else if (data.status === "triggered") {
@@ -307,6 +323,10 @@ export default function App() {
             <button onClick={add}>Add</button>
           </div>
 
+          <div className="hint">
+            These URLs will be scraped for each item in your list.
+          </div>
+
           <table className="table">
             <thead>
               <tr>
@@ -336,10 +356,6 @@ export default function App() {
               ))}
             </tbody>
           </table>
-
-          <div className="hint">
-            Worker runs every 6 hours by default. Override with <span className="badge">CHECK_INTERVAL_HOURS</span>.
-          </div>
         </div>
       )}
 
@@ -399,18 +415,11 @@ export default function App() {
               ))}
             </tbody>
           </table>
-
-          <div className="hint">
-            These URLs will be scraped for each item in your list.
-          </div>
         </div>
       )}
 
       {tab === "matches" && (
         <div className="tab-content">
-          <div className="hint">
-            Matches are deduped on (item_id, matched_url, source_site). New inserts can trigger Twilio SMS if configured.
-          </div>
           <table className="table" style={{ width: '100%' }}>
             <thead>
               <tr>
@@ -435,14 +444,14 @@ export default function App() {
                   <td style={{ textAlign: 'center' }}>
                     {m.magnet_link ? (
                       <a href={m.magnet_link} title="Open magnet link">
-                        <svg 
-                          width="18" 
-                          height="18" 
-                          viewBox="0 0 24 24" 
-                          fill="none" 
-                          stroke="#0078D4" 
-                          strokeWidth="2" 
-                          strokeLinecap="round" 
+                        <svg
+                          width="18"
+                          height="18"
+                          viewBox="0 0 24 24"
+                          fill="none"
+                          stroke="#0078D4"
+                          strokeWidth="2"
+                          strokeLinecap="round"
                           strokeLinejoin="round"
                         >
                           <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"></path>
@@ -456,25 +465,25 @@ export default function App() {
                   </td>
                   <td style={{ whiteSpace: 'nowrap' }}>{m.created}</td>
                   <td style={{ textAlign: 'center' }}>
-                    <button 
-                      className="small" 
+                    <button
+                      className="small"
                       onClick={() => removeMatch(m.id)}
-                      style={{ 
-                        background: 'transparent', 
-                        border: 'none', 
+                      style={{
+                        background: 'transparent',
+                        border: 'none',
                         cursor: 'pointer',
                         padding: '4px'
                       }}
                       title="Delete match"
                     >
-                      <svg 
-                        width="18" 
-                        height="18" 
-                        viewBox="0 0 24 24" 
-                        fill="none" 
-                        stroke="#D13438" 
-                        strokeWidth="2" 
-                        strokeLinecap="round" 
+                      <svg
+                        width="18"
+                        height="18"
+                        viewBox="0 0 24 24"
+                        fill="none"
+                        stroke="#D13438"
+                        strokeWidth="2"
+                        strokeLinecap="round"
                         strokeLinejoin="round"
                       >
                         <polyline points="3 6 5 6 21 6"></polyline>
@@ -493,8 +502,8 @@ export default function App() {
 
       {tab === "logs" && (
         <div className="tab-content">
-          <div className="hint">
-            Logs show the completion status of each item processed by the worker.
+          <div className="clear_logs">
+            <button onClick={() => clearLogs()}>Clear Logs</button>
           </div>
           <table className="table" style={{ width: '100%' }}>
             <thead>
@@ -512,9 +521,9 @@ export default function App() {
                   </td>
                   <td>{log.description}</td>
                   <td style={{ textAlign: 'center' }}>
-                    <span style={{ 
-                      padding: '4px 8px', 
-                      borderRadius: '4px', 
+                    <span style={{
+                      padding: '4px 8px',
+                      borderRadius: '4px',
                       fontSize: '12px',
                       fontWeight: 'bold',
                       backgroundColor: log.success ? '#d4edda' : '#f8d7da',
@@ -527,25 +536,25 @@ export default function App() {
               ))}
             </tbody>
           </table>
-          
+
           {logsTotalPages > 1 && (
-            <div style={{ 
-              display: 'flex', 
-              justifyContent: 'center', 
-              alignItems: 'center', 
-              gap: '10px', 
-              marginTop: '20px' 
+            <div style={{
+              display: 'flex',
+              justifyContent: 'center',
+              alignItems: 'center',
+              gap: '10px',
+              marginTop: '20px'
             }}>
-              <button 
-                onClick={() => loadLogs(logsPage - 1)} 
+              <button
+                onClick={() => loadLogs(logsPage - 1)}
                 disabled={logsPage === 1}
                 style={{ padding: '8px 16px' }}
               >
                 Previous
               </button>
               <span>Page {logsPage} of {logsTotalPages}</span>
-              <button 
-                onClick={() => loadLogs(logsPage + 1)} 
+              <button
+                onClick={() => loadLogs(logsPage + 1)}
                 disabled={logsPage === logsTotalPages}
                 style={{ padding: '8px 16px' }}
               >
