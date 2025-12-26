@@ -1,11 +1,3 @@
-# Environment variables
-.env
-*.env
-
-# Data directory
-data/
-*.db
-
 # Git
 .git/
 .gitignore
@@ -15,6 +7,10 @@ node_modules/
 npm-debug.log*
 yarn-debug.log*
 yarn-error.log*
+frontend/dist/
+
+# Backend build artifacts
+backend/data/
 
 # IDE
 .vscode/
@@ -26,3 +22,14 @@ yarn-error.log*
 # OS
 .DS_Store
 Thumbs.db
+
+# Documentation
+README.md
+
+# Docker
+docker-compose.yml
+.dockerignore
+
+# Backup scripts
+backup_db.sh
+backups/

@@ -199,22 +199,22 @@ export default function App() {
     }
   }
 
-  async function removeMatch(id: number) {
-    console.log("removeMatch called with ID:", id);
+  async function softDeleteMatch(id: number) {
+    console.log("softDeleteMatch called with ID:", id);
     try {
       const url = `/api/matches/${id}`;
       console.log("Sending DELETE request to:", url);
       const res = await fetch(url, { method: "DELETE" });
       if (!res.ok) {
         const text = await res.text();
-        console.error("Delete match failed:", res.status, text);
-        alert(`Failed to delete match: ${text}`);
+        console.error("Soft delete match failed:", res.status, text);
+        alert(`Failed to hide match: ${text}`);
         return;
       }
-      console.log("Delete successful, reloading matches...");
+      console.log("Soft delete successful, reloading matches...");
     } catch (err) {
-      console.error("Delete match error:", err);
-      alert("Failed to delete match");
+      console.error("Soft delete match error:", err);
+      alert("Failed to hide match");
       return;
     }
     await loadMatches();
@@ -467,14 +467,14 @@ export default function App() {
                   <td style={{ textAlign: 'center' }}>
                     <button
                       className="small"
-                      onClick={() => removeMatch(m.id)}
+                      onClick={() => softDeleteMatch(m.id)}
                       style={{
                         background: 'transparent',
                         border: 'none',
                         cursor: 'pointer',
                         padding: '4px'
                       }}
-                      title="Delete match"
+                      title="Hide match"
                     >
                       <svg
                         width="18"

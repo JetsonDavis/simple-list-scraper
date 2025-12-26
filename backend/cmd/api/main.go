@@ -283,9 +283,13 @@ func runWorker() {
 
     var pw *playwright.Playwright
     if !disablePW {
-        if err := playwright.Install(); err != nil {
-            // In container builds we already install browsers; this is a fallback.
-            log.Println("playwright.Install warning:", err)
+        // Skip installation if browsers are pre-installed (e.g., in Docker)
+        skipInstall := os.Getenv("PLAYWRIGHT_SKIP_INSTALL") == "1"
+        if !skipInstall {
+            if err := playwright.Install(); err != nil {
+                // In container builds we already install browsers; this is a fallback.
+                log.Println("playwright.Install warning:", err)
+            }
         }
         pw, err = playwright.Run()
         if err != nil {
@@ -300,6 +304,16 @@ func runWorker() {
     for _, it := range items {
         matchesFound := 0
         maxMatchesPerItem := 5
+
+        // Load soft-deleted URLs for this item to skip them
+        softDeletedURLs, err := loadSoftDeletedURLs(it.ID)
+        if err != nil {
+            log.Printf("Failed to load soft-deleted URLs for item %q: %v\n", it.Text, err)
+            softDeletedURLs = make(map[string]bool) // Continue with empty map
+        }
+        if len(softDeletedURLs) > 0 {
+            log.Printf("Loaded %d soft-deleted URLs for item %q\n", len(softDeletedURLs), it.Text)
+        }
 
         for _, s := range scrapers {
             // Check if we've already found enough matches for this item
@@ -319,6 +333,12 @@ func runWorker() {
                 // Check if we've reached the limit during result processing
                 if matchesFound >= maxMatchesPerItem {
                     break
+                }
+
+                // Check if this URL was previously soft-deleted for this item
+                if softDeletedURLs[r.URL] {
+                    log.Printf("SOFT_DELETED_SKIP site=%s url=%s title=%q - previously hidden by user\n", s.Name(), r.URL, r.Title)
+                    continue
                 }
 
                 // Check quality FIRST before any other processing
@@ -897,6 +917,28 @@ func insertMatchWithEntities(itemID int64, matchedText, matchedURL, sourceSite, 
     return n > 0, nil
 }
 
+func loadSoftDeletedURLs(itemID int64) (map[string]bool, error) {
+    rows, err := db.Query(`
+        SELECT matched_url 
+        FROM matches 
+        WHERE item_id = $1 AND soft_delete = TRUE
+    `, itemID)
+    if err != nil {
+        return nil, err
+    }
+    defer rows.Close()
+
+    softDeletedURLs := make(map[string]bool)
+    for rows.Next() {
+        var url string
+        if err := rows.Scan(&url); err != nil {
+            return nil, err
+        }
+        softDeletedURLs[url] = true
+    }
+    return softDeletedURLs, nil
+}
+
 func insertLog(description string, success bool) error {
     _, err := db.Exec(`
         INSERT INTO logs(description, success)
@@ -1192,6 +1234,7 @@ func matchesHandler(w http.ResponseWriter, r *http.Request) {
         SELECT m.id, i.text, m.matched_url, m.source_site, COALESCE(m.torrent_text, ''), COALESCE(m.magnet_link, ''), COALESCE(m.file_size, ''), m.created_at
         FROM matches m
         JOIN items i ON i.id = m.item_id
+        WHERE m.soft_delete = FALSE
         ORDER BY m.created_at DESC
         LIMIT 200
     `)
@@ -1321,7 +1364,7 @@ func matchHandler(w http.ResponseWriter, r *http.Request) {
         return
     }
 
-    result, err := db.Exec("DELETE FROM matches WHERE id=$1", id)
+    result, err := db.Exec("UPDATE matches SET soft_delete = TRUE WHERE id=$1", id)
     if err != nil {
         log.Printf("DELETE /api/matches/%d - Database error: %v\n", id, err)
         http.Error(w, err.Error(), http.StatusInternalServerError)
@@ -1329,7 +1372,7 @@ func matchHandler(w http.ResponseWriter, r *http.Request) {
     }
 
     rowsAffected, _ := result.RowsAffected()
-    log.Printf("DELETE /api/matches/%d - Successfully deleted %d row(s)\n", id, rowsAffected)
+    log.Printf("DELETE /api/matches/%d - Successfully soft deleted %d row(s)\n", id, rowsAffected)
 
     writeJSON(w, map[string]any{"ok": true})
 }
@@ -1495,6 +1538,7 @@ func initDB(db *sql.DB) error {
             magnet_link TEXT,
             entities JSONB,
             file_size VARCHAR(50),
+            soft_delete BOOLEAN DEFAULT FALSE,
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
             FOREIGN KEY (item_id) REFERENCES items(id) ON DELETE CASCADE
         );`,
@@ -1570,6 +1614,28 @@ func initDB(db *sql.DB) error {
                 WHERE table_name = 'matches' AND column_name = 'magnet_link'
             ) THEN
                 ALTER TABLE matches ADD COLUMN magnet_link TEXT;
+            END IF;
+        END $$;`,
+
+        // Add file_size column if it doesn't exist
+        `DO $$ 
+        BEGIN 
+            IF NOT EXISTS (
+                SELECT 1 FROM information_schema.columns 
+                WHERE table_name = 'matches' AND column_name = 'file_size'
+            ) THEN
+                ALTER TABLE matches ADD COLUMN file_size VARCHAR(50);
+            END IF;
+        END $$;`,
+
+        // Add soft_delete column if it doesn't exist
+        `DO $$ 
+        BEGIN 
+            IF NOT EXISTS (
+                SELECT 1 FROM information_schema.columns 
+                WHERE table_name = 'matches' AND column_name = 'soft_delete'
+            ) THEN
+                ALTER TABLE matches ADD COLUMN soft_delete BOOLEAN DEFAULT FALSE;
             END IF;
         END $$;`,
 
