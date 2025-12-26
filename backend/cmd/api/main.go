@@ -118,7 +118,7 @@ func main() {
     useEntityMatching := strings.ToLower(os.Getenv("USE_ENTITY_MATCHING")) == "true"
     if useEntityMatching {
         log.Println("Entity matching enabled, starting Ollama if needed...")
-        
+
         // Try to start Ollama if it's not running
         if err := startOllama(); err != nil {
             log.Printf("WARNING: Failed to start Ollama: %v", err)
@@ -179,7 +179,7 @@ func main() {
 
     <-ctx.Done()
     log.Println("Shutting down...")
-    
+
     // Stop Ollama if we started it
     if ollamaCmd != nil && ollamaCmd.Process != nil {
         log.Println("Stopping Ollama server...")
@@ -189,7 +189,7 @@ func main() {
             log.Println("Ollama server stopped")
         }
     }
-    
+
     shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
     defer cancel()
     _ = server.Shutdown(shutdownCtx)
@@ -300,14 +300,14 @@ func runWorker() {
     for _, it := range items {
         matchesFound := 0
         maxMatchesPerItem := 5
-        
+
         for _, s := range scrapers {
             // Check if we've already found enough matches for this item
             if matchesFound >= maxMatchesPerItem {
                 log.Printf("Found %d matches for item %q, moving to next item\n", matchesFound, it.Text)
                 break
             }
-            
+
             results, err := s.Search(context.Background(), pw, it.Text)
             if err != nil {
                 log.Printf("scraper %s error: %v\n", s.Name(), err)
@@ -320,7 +320,7 @@ func runWorker() {
                 if matchesFound >= maxMatchesPerItem {
                     break
                 }
-                
+
                 // Check quality FIRST before any other processing
                 if disqualifiedQuality(r.Title) {
                     log.Printf("DISQUALIFIED_QUALITY site=%s url=%s title=%q - skipping\n", s.Name(), r.URL, r.Title)
@@ -330,49 +330,49 @@ func runWorker() {
                 // Extract year from item text
                 itemYear := extractYear(it.Text)
                 itemWithoutYear := removeYear(it.Text)
-                
+
                 // Log item year extraction
                 if itemYear != "" {
                     log.Printf("Item year extracted: %q has year=%s (without year: %q)\n", it.Text, itemYear, itemWithoutYear)
                 } else {
                     log.Printf("Item has no year: %q\n", it.Text)
                 }
-                
+
                 // Log the scraped torrent title before processing
                 log.Printf("Scraped from page: title=%q url=%s\n", r.Title, r.URL)
-                
+
                 // Pre-filter: Check if item text appears as contiguous phrase in result
                 // Normalize both strings and check if item words appear together in order
                 normalizedItem := normalize(removeYear(it.Text))
                 normalizedTitle := normalize(r.Title)
-                
+
                 // Check if the item appears as a contiguous phrase (allowing for extra chars like dots, dashes)
                 // Replace common separators with spaces for matching
                 titleForMatching := strings.ReplaceAll(normalizedTitle, ".", " ")
                 titleForMatching = strings.ReplaceAll(titleForMatching, "-", " ")
                 titleForMatching = strings.ReplaceAll(titleForMatching, "_", " ")
-                
+
                 itemForMatching := strings.ReplaceAll(normalizedItem, ".", " ")
                 itemForMatching = strings.ReplaceAll(itemForMatching, "-", " ")
                 itemForMatching = strings.ReplaceAll(itemForMatching, "_", " ")
-                
+
                 // Collapse multiple spaces
                 titleForMatching = strings.Join(strings.Fields(titleForMatching), " ")
                 itemForMatching = strings.Join(strings.Fields(itemForMatching), " ")
-                
+
                 if !strings.Contains(titleForMatching, itemForMatching) {
-                    log.Printf("PRE_FILTER_REJECTED: item phrase %q not found contiguously in title %q - skipping LLM\n", 
+                    log.Printf("PRE_FILTER_REJECTED: item phrase %q not found contiguously in title %q - skipping LLM\n",
                         itemForMatching, titleForMatching)
                     continue
                 }
-                
+
                 log.Printf("PRE_FILTER_PASSED: item phrase %q found in title - proceeding to LLM\n", itemForMatching)
-                
+
                 // Extract entities from torrent title using LLM
                 var entitiesJSON []byte = []byte("[]") // Initialize to empty JSON array
                 var entities []Entity
                 useEntityMatching := strings.ToLower(os.Getenv("USE_ENTITY_MATCHING")) == "true"
-                
+
                 if useEntityMatching {
                     log.Printf(">>> CALLING LLM for entity extraction: %q\n", r.Title)
                     entityResp, err := extractEntities(r.Title)
@@ -385,7 +385,7 @@ func runWorker() {
                         entitiesJSON, _ = json.Marshal(entities)
                         log.Printf("Extracted %d entities from %q (URL: %s):\n", len(entities), r.Title, r.URL)
                         for i, entity := range entities {
-                            log.Printf("  [%d] Type: %-20s Text: %-30s Confidence: %.2f\n", 
+                            log.Printf("  [%d] Type: %-20s Text: %-30s Confidence: %.2f\n",
                                 i+1, entity.Type, entity.Text, entity.Confidence)
                         }
                     }
@@ -393,21 +393,21 @@ func runWorker() {
 
                 // Determine what to compare based on entity extraction
                 var matched bool
-                
+
                 if useEntityMatching && len(entities) > 0 {
                     // Entity-based matching
                     filmTitleEntity := findEntityByType(entities, "FILM TITLE")
                     yearEntity := findEntityByType(entities, "YEAR")
-                    
+
                     if filmTitleEntity != nil {
                         // Compare item (without year) against FILM TITLE entity - EXACT MATCH REQUIRED
                         itemTitleLower := strings.ToLower(strings.TrimSpace(itemWithoutYear))
                         filmTitleLower := strings.ToLower(strings.TrimSpace(filmTitleEntity.Text))
                         exactMatch := itemTitleLower == filmTitleLower
-                        
-                        log.Printf("EXACT_MATCH_CHECK item=%q (no year: %q) filmTitle=%q match=%v\n", 
+
+                        log.Printf("EXACT_MATCH_CHECK item=%q (no year: %q) filmTitle=%q match=%v\n",
                             it.Text, itemWithoutYear, filmTitleEntity.Text, exactMatch)
-                        
+
                         if exactMatch {
                             // If item has a year, verify it matches
                             if itemYear != "" {
@@ -433,7 +433,7 @@ func runWorker() {
                         log.Printf("NO_FILM_TITLE_ENTITY for %q - falling back to fuzzy\n", r.Title)
                     }
                 }
-                
+
                 // Fall back to simple fuzzy matching if entity matching didn't work
                 if !matched {
                     score := fuzzyScore(it.Text, r.Title)
@@ -442,7 +442,7 @@ func runWorker() {
                         matched = true
                     }
                 }
-                
+
                 if !matched {
                     continue
                 }
@@ -480,7 +480,7 @@ func runWorker() {
                     if err := maybeSendTwilioSMS(it.Text, r.Title, r.URL, s.Name()); err != nil {
                         log.Printf("twilio sms error: %v\n", err)
                     }
-                    
+
                     // Check if we've reached the limit after inserting
                     if matchesFound >= maxMatchesPerItem {
                         log.Printf("Reached %d matches for item %q, moving to next item\n", matchesFound, it.Text)
@@ -489,7 +489,7 @@ func runWorker() {
                 }
             }
         }
-        
+
         // Log completion of this item
         success := matchesFound > 0
         description := fmt.Sprintf("Item '%s' completed with %d match(es)", it.Text, matchesFound)
@@ -497,7 +497,7 @@ func runWorker() {
             log.Printf("Failed to insert log for item %q: %v\n", it.Text, err)
         } else {
             log.Printf("LOG: %s (success=%v)\n", description, success)
-            
+
             // Broadcast new log via WebSocket
             broadcastNewLog(map[string]any{
                 "description": description,
@@ -602,19 +602,19 @@ func disqualifiedQuality(title string) bool {
     // e.g. "Movie TS 1080p" -> disqualify
     // e.g. "Movie.TELECINE.avi" -> disqualify
     // e.g. "Movie (Original Motion Picture Soundtrack)" -> disqualify
-    
+
     // Check for Soundtrack (case-insensitive)
     if strings.Contains(strings.ToLower(title), "soundtrack") {
         log.Printf("QUALITY_CHECK: Disqualified %q - contains 'soundtrack'\n", title)
         return true
     }
-    
+
     // Check for Telesync
     if strings.Contains(title, "Telesync") {
         log.Printf("QUALITY_CHECK: Disqualified %q - contains 'Telesync'\n", title)
         return true
     }
-    
+
     // Split by spaces first
     tokens := strings.Fields(title)
     for _, t := range tokens {
@@ -624,13 +624,13 @@ func disqualifiedQuality(title string) bool {
         })
         for _, st := range subTokens {
             stUpper := strings.ToUpper(st)
-            if stUpper == "TS" || stUpper == "CAM" || stUpper == "TELECINE" || stUpper == "HDCAM" || stUpper == "CAMRIP" {
+            if stUpper == "TS" || stUpper == "CAM" || stUpper == "TELECINE" || stUpper == "HDCAM" || stUpper == "CAMRIP" || stUpper == "HDTS" {
                 log.Printf("QUALITY_CHECK: Disqualified %q - found token %q\n", title, st)
                 return true
             }
         }
     }
-    
+
     return false
 }
 
@@ -666,7 +666,7 @@ func startOllama() error {
     if ollamaURL == "" {
         ollamaURL = "http://localhost:11434"
     }
-    
+
     // Check if Ollama is already running
     resp, err := http.Get(ollamaURL + "/api/tags")
     if err == nil {
@@ -674,18 +674,18 @@ func startOllama() error {
         log.Println("Ollama is already running")
         return nil
     }
-    
+
     // Ollama is not running, start it
     log.Println("Starting Ollama server...")
     ollamaCmd = exec.Command("ollama", "serve")
-    
+
     // Start the process in the background
     if err := ollamaCmd.Start(); err != nil {
         return fmt.Errorf("failed to start Ollama: %w", err)
     }
-    
+
     log.Printf("Ollama server started with PID %d", ollamaCmd.Process.Pid)
-    
+
     // Wait for Ollama to be ready (max 30 seconds)
     for i := 0; i < 30; i++ {
         time.Sleep(1 * time.Second)
@@ -696,7 +696,7 @@ func startOllama() error {
             return nil
         }
     }
-    
+
     return fmt.Errorf("Ollama server did not become ready within 30 seconds")
 }
 
@@ -705,34 +705,34 @@ func checkOllamaHealth() error {
     if ollamaURL == "" {
         ollamaURL = "http://localhost:11434"
     }
-    
+
     // Check if Ollama is running
     resp, err := http.Get(ollamaURL + "/api/tags")
     if err != nil {
         return fmt.Errorf("Ollama is not running at %s: %w", ollamaURL, err)
     }
     defer resp.Body.Close()
-    
+
     if resp.StatusCode != http.StatusOK {
         return fmt.Errorf("Ollama returned status %d", resp.StatusCode)
     }
-    
+
     // Check if the specified model is available
     ollamaModel := os.Getenv("OLLAMA_MODEL")
     if ollamaModel == "" {
         ollamaModel = "llama2"
     }
-    
+
     var result struct {
         Models []struct {
             Name string `json:"name"`
         } `json:"models"`
     }
-    
+
     if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
         return fmt.Errorf("failed to decode Ollama models list: %w", err)
     }
-    
+
     modelFound := false
     for _, m := range result.Models {
         if strings.HasPrefix(m.Name, ollamaModel) {
@@ -740,11 +740,11 @@ func checkOllamaHealth() error {
             break
         }
     }
-    
+
     if !modelFound {
         return fmt.Errorf("model %q not found in Ollama. Run: ollama pull %s", ollamaModel, ollamaModel)
     }
-    
+
     // Initialize the model by making a test generation call
     // This loads the model into memory if it's not already loaded
     log.Printf("Initializing model %q...", ollamaModel)
@@ -753,23 +753,23 @@ func checkOllamaHealth() error {
         Prompt: "Hello",
         Stream: false,
     }
-    
+
     jsonData, err := json.Marshal(testReq)
     if err != nil {
         return fmt.Errorf("failed to marshal test request: %w", err)
     }
-    
+
     testResp, err := http.Post(ollamaURL+"/api/generate", "application/json", bytes.NewBuffer(jsonData))
     if err != nil {
         return fmt.Errorf("failed to initialize model: %w", err)
     }
     defer testResp.Body.Close()
-    
+
     if testResp.StatusCode != http.StatusOK {
         body, _ := io.ReadAll(testResp.Body)
         return fmt.Errorf("model initialization failed with status %d: %s", testResp.StatusCode, string(body))
     }
-    
+
     log.Printf("Model %q initialized successfully", ollamaModel)
     return nil
 }
@@ -779,7 +779,7 @@ func extractEntities(text string) (*EntityExtractionResponse, error) {
     if ollamaURL == "" {
         ollamaURL = "http://localhost:11434" // Default Ollama URL
     }
-    
+
     ollamaModel := os.Getenv("OLLAMA_MODEL")
     if ollamaModel == "" {
         ollamaModel = "llama2" // Default model
@@ -844,7 +844,7 @@ JSON output:`
         // Successfully parsed as array
         return &EntityExtractionResponse{Entities: entities}, nil
     }
-    
+
     // Try to parse as object with "entities" field
     var entityResp EntityExtractionResponse
     if err := json.Unmarshal([]byte(ollamaResp.Response), &entityResp); err != nil {
@@ -872,12 +872,24 @@ func insertMatchDedup(itemID int64, matchedText, matchedURL, sourceSite, torrent
 }
 
 func insertMatchWithEntities(itemID int64, matchedText, matchedURL, sourceSite, torrentText, magnetLink string, entitiesJSON []byte) (bool, error) {
+    // Extract file size from entities
+    var fileSize string
+    var entities []Entity
+    if err := json.Unmarshal(entitiesJSON, &entities); err == nil {
+        for _, entity := range entities {
+            if strings.ToUpper(entity.Type) == "FILE SIZE" || strings.ToUpper(entity.Type) == "FILESIZE" {
+                fileSize = entity.Text
+                break
+            }
+        }
+    }
+
     // ON CONFLICT DO NOTHING provides dedupe via unique index (item_id, matched_url, source_site)
     res, err := db.Exec(`
-        INSERT INTO matches(item_id, matched_text, matched_url, source_site, torrent_text, magnet_link, entities)
-        VALUES ($1, $2, $3, $4, $5, $6, $7)
+        INSERT INTO matches(item_id, matched_text, matched_url, source_site, torrent_text, magnet_link, entities, file_size)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
         ON CONFLICT (item_id, matched_url, source_site) DO NOTHING
-    `, itemID, matchedText, matchedURL, sourceSite, torrentText, magnetLink, entitiesJSON)
+    `, itemID, matchedText, matchedURL, sourceSite, torrentText, magnetLink, entitiesJSON, fileSize)
     if err != nil {
         return false, err
     }
@@ -967,7 +979,7 @@ func itemsHandler(w http.ResponseWriter, r *http.Request) {
             http.Error(w, "text required", http.StatusBadRequest)
             return
         }
-        
+
         // Check if item already exists
         var existingID int64
         err := db.QueryRow(`SELECT id FROM items WHERE text = $1`, text).Scan(&existingID)
@@ -981,7 +993,7 @@ func itemsHandler(w http.ResponseWriter, r *http.Request) {
             http.Error(w, err.Error(), http.StatusInternalServerError)
             return
         }
-        
+
         res, err := db.Exec(`INSERT INTO items(text) VALUES ($1)`, text)
         if err != nil {
             http.Error(w, err.Error(), http.StatusInternalServerError)
@@ -1071,7 +1083,7 @@ func urlsHandler(w http.ResponseWriter, r *http.Request) {
         configStr := strings.TrimSpace(r.FormValue("config"))
         var res sql.Result
         var err error
-        
+
         if configStr != "" && displayName != "" {
             res, err = db.Exec(`INSERT INTO urls(url, display_name, config) VALUES ($1, $2, $3::jsonb)`, urlStr, displayName, configStr)
         } else if configStr != "" {
@@ -1112,17 +1124,17 @@ func urlHandler(w http.ResponseWriter, r *http.Request) {
         urlStr := strings.TrimSpace(r.FormValue("url"))
         displayName := strings.TrimSpace(r.FormValue("display_name"))
         configStr := strings.TrimSpace(r.FormValue("config"))
-        
+
         if urlStr == "" && displayName == "" && configStr == "" {
             http.Error(w, "url, display_name, or config required", http.StatusBadRequest)
             return
         }
-        
+
         // Build dynamic update query
         updates := []string{}
         args := []interface{}{}
         argPos := 1
-        
+
         if urlStr != "" {
             updates = append(updates, fmt.Sprintf("url=$%d", argPos))
             args = append(args, urlStr)
@@ -1138,13 +1150,13 @@ func urlHandler(w http.ResponseWriter, r *http.Request) {
             args = append(args, configStr)
             argPos++
         }
-        
+
         updates = append(updates, "updated_at=CURRENT_TIMESTAMP")
         args = append(args, id)
-        
+
         query := fmt.Sprintf("UPDATE urls SET %s WHERE id=$%d", strings.Join(updates, ", "), argPos)
         _, err = db.Exec(query, args...)
-        
+
         if err != nil {
             http.Error(w, err.Error(), http.StatusInternalServerError)
             return
@@ -1170,14 +1182,14 @@ func matchesHandler(w http.ResponseWriter, r *http.Request) {
     } else {
         log.Printf("GET /api/matches - No query params")
     }
-    
+
     if r.Method != http.MethodGet {
         w.WriteHeader(http.StatusMethodNotAllowed)
         return
     }
 
     rows, err := db.Query(`
-        SELECT m.id, i.text, m.matched_url, m.source_site, COALESCE(m.torrent_text, ''), COALESCE(m.magnet_link, ''), m.created_at
+        SELECT m.id, i.text, m.matched_url, m.source_site, COALESCE(m.torrent_text, ''), COALESCE(m.magnet_link, ''), COALESCE(m.file_size, ''), m.created_at
         FROM matches m
         JOIN items i ON i.id = m.item_id
         ORDER BY m.created_at DESC
@@ -1196,12 +1208,13 @@ func matchesHandler(w http.ResponseWriter, r *http.Request) {
         Site        string `json:"site"`
         TorrentText string `json:"torrent_text,omitempty"`
         MagnetLink  string `json:"magnet_link,omitempty"`
+        FileSize    string `json:"file_size,omitempty"`
         Created     string `json:"created"`
     }
     out := make([]Match, 0, 200)
     for rows.Next() {
         var m Match
-        if err := rows.Scan(&m.ID, &m.Item, &m.URL, &m.Site, &m.TorrentText, &m.MagnetLink, &m.Created); err != nil {
+        if err := rows.Scan(&m.ID, &m.Item, &m.URL, &m.Site, &m.TorrentText, &m.MagnetLink, &m.FileSize, &m.Created); err != nil {
             http.Error(w, err.Error(), http.StatusInternalServerError)
             return
         }
@@ -1211,68 +1224,85 @@ func matchesHandler(w http.ResponseWriter, r *http.Request) {
 }
 
 func logsHandler(w http.ResponseWriter, r *http.Request) {
-    if r.Method != http.MethodGet {
-        w.WriteHeader(http.StatusMethodNotAllowed)
-        return
-    }
-
-    // Parse pagination parameters
-    pageStr := r.URL.Query().Get("page")
-    page := 1
-    if pageStr != "" {
-        if p, err := strconv.Atoi(pageStr); err == nil && p > 0 {
-            page = p
+    switch r.Method {
+    case http.MethodGet:
+        // Parse pagination parameters
+        pageStr := r.URL.Query().Get("page")
+        page := 1
+        if pageStr != "" {
+            if p, err := strconv.Atoi(pageStr); err == nil && p > 0 {
+                page = p
+            }
         }
-    }
-    
-    pageSize := 25
-    offset := (page - 1) * pageSize
 
-    // Get total count
-    var total int
-    err := db.QueryRow(`SELECT COUNT(*) FROM logs`).Scan(&total)
-    if err != nil {
-        http.Error(w, err.Error(), http.StatusInternalServerError)
-        return
-    }
+        pageSize := 25
+        offset := (page - 1) * pageSize
 
-    // Get paginated logs
-    rows, err := db.Query(`
-        SELECT id, timestamp, description, success
-        FROM logs
-        ORDER BY timestamp DESC
-        LIMIT $1 OFFSET $2
-    `, pageSize, offset)
-    if err != nil {
-        http.Error(w, err.Error(), http.StatusInternalServerError)
-        return
-    }
-    defer rows.Close()
-
-    type Log struct {
-        ID          int64  `json:"id"`
-        Timestamp   string `json:"timestamp"`
-        Description string `json:"description"`
-        Success     bool   `json:"success"`
-    }
-    
-    logs := make([]Log, 0, pageSize)
-    for rows.Next() {
-        var l Log
-        if err := rows.Scan(&l.ID, &l.Timestamp, &l.Description, &l.Success); err != nil {
+        // Get total count
+        var total int
+        err := db.QueryRow(`SELECT COUNT(*) FROM logs`).Scan(&total)
+        if err != nil {
             http.Error(w, err.Error(), http.StatusInternalServerError)
             return
         }
-        logs = append(logs, l)
+
+        // Get paginated logs
+        rows, err := db.Query(`
+            SELECT id, timestamp, description, success
+            FROM logs
+            ORDER BY timestamp DESC
+            LIMIT $1 OFFSET $2
+        `, pageSize, offset)
+        if err != nil {
+            http.Error(w, err.Error(), http.StatusInternalServerError)
+            return
+        }
+        defer rows.Close()
+
+        type Log struct {
+            ID          int64  `json:"id"`
+            Timestamp   string `json:"timestamp"`
+            Description string `json:"description"`
+            Success     bool   `json:"success"`
+        }
+
+        logs := make([]Log, 0, pageSize)
+        for rows.Next() {
+            var l Log
+            if err := rows.Scan(&l.ID, &l.Timestamp, &l.Description, &l.Success); err != nil {
+                http.Error(w, err.Error(), http.StatusInternalServerError)
+                return
+            }
+            logs = append(logs, l)
+        }
+
+        writeJSON(w, map[string]any{
+            "logs":       logs,
+            "page":       page,
+            "page_size":  pageSize,
+            "total":      total,
+            "total_pages": (total + pageSize - 1) / pageSize,
+        })
+
+    case http.MethodDelete:
+        // Delete all logs
+        result, err := db.Exec(`DELETE FROM logs`)
+        if err != nil {
+            http.Error(w, err.Error(), http.StatusInternalServerError)
+            return
+        }
+
+        rowsAffected, _ := result.RowsAffected()
+        log.Printf("Cleared %d log entries", rowsAffected)
+
+        writeJSON(w, map[string]any{
+            "ok":      true,
+            "deleted": rowsAffected,
+        })
+
+    default:
+        w.WriteHeader(http.StatusMethodNotAllowed)
     }
-    
-    writeJSON(w, map[string]any{
-        "logs":       logs,
-        "page":       page,
-        "page_size":  pageSize,
-        "total":      total,
-        "total_pages": (total + pageSize - 1) / pageSize,
-    })
 }
 
 func matchHandler(w http.ResponseWriter, r *http.Request) {
@@ -1283,7 +1313,7 @@ func matchHandler(w http.ResponseWriter, r *http.Request) {
 
     idStr := strings.TrimPrefix(r.URL.Path, "/api/matches/")
     log.Printf("DELETE /api/matches/%s - Attempting to delete match ID: %s\n", idStr, idStr)
-    
+
     id, err := strconv.ParseInt(idStr, 10, 64)
     if err != nil {
         log.Printf("DELETE /api/matches/%s - Invalid ID format: %v\n", idStr, err)
@@ -1297,7 +1327,7 @@ func matchHandler(w http.ResponseWriter, r *http.Request) {
         http.Error(w, err.Error(), http.StatusInternalServerError)
         return
     }
-    
+
     rowsAffected, _ := result.RowsAffected()
     log.Printf("DELETE /api/matches/%d - Successfully deleted %d row(s)\n", id, rowsAffected)
 
@@ -1321,7 +1351,7 @@ func triggerWorkerHandler(w http.ResponseWriter, r *http.Request) {
     } else {
         log.Printf("POST /api/trigger-worker - No query params")
     }
-    
+
     if r.Method != http.MethodPost {
         w.WriteHeader(http.StatusMethodNotAllowed)
         return
@@ -1349,13 +1379,13 @@ func wsHandler(w http.ResponseWriter, r *http.Request) {
         log.Printf("WebSocket upgrade error: %v", err)
         return
     }
-    
+
     wsClientsMux.Lock()
     wsClients[conn] = true
     wsClientsMux.Unlock()
-    
+
     log.Printf("WebSocket client connected. Total clients: %d", len(wsClients))
-    
+
     // Keep connection alive and handle disconnection
     defer func() {
         wsClientsMux.Lock()
@@ -1364,7 +1394,7 @@ func wsHandler(w http.ResponseWriter, r *http.Request) {
         conn.Close()
         log.Printf("WebSocket client disconnected. Total clients: %d", len(wsClients))
     }()
-    
+
     // Read messages from client (ping/pong to keep alive)
     for {
         _, _, err := conn.ReadMessage()
@@ -1377,13 +1407,13 @@ func wsHandler(w http.ResponseWriter, r *http.Request) {
 func broadcastWorkerStatus(status string, message string) {
     wsClientsMux.Lock()
     defer wsClientsMux.Unlock()
-    
+
     msg := map[string]any{
         "type":    "worker_status",
         "status":  status,
         "message": message,
     }
-    
+
     for client := range wsClients {
         if err := client.WriteJSON(msg); err != nil {
             log.Printf("WebSocket write error: %v", err)
@@ -1396,12 +1426,12 @@ func broadcastWorkerStatus(status string, message string) {
 func broadcastNewMatch(match map[string]any) {
     wsClientsMux.Lock()
     defer wsClientsMux.Unlock()
-    
+
     msg := map[string]any{
         "type":  "new_match",
         "match": match,
     }
-    
+
     for client := range wsClients {
         if err := client.WriteJSON(msg); err != nil {
             log.Printf("WebSocket write error: %v", err)
@@ -1414,12 +1444,12 @@ func broadcastNewMatch(match map[string]any) {
 func broadcastNewLog(logEntry map[string]any) {
     wsClientsMux.Lock()
     defer wsClientsMux.Unlock()
-    
+
     msg := map[string]any{
         "type": "new_log",
         "log":  logEntry,
     }
-    
+
     for client := range wsClients {
         if err := client.WriteJSON(msg); err != nil {
             log.Printf("WebSocket write error: %v", err)
@@ -1464,6 +1494,7 @@ func initDB(db *sql.DB) error {
             torrent_text VARCHAR(500),
             magnet_link TEXT,
             entities JSONB,
+            file_size VARCHAR(50),
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
             FOREIGN KEY (item_id) REFERENCES items(id) ON DELETE CASCADE
         );`,
@@ -1610,7 +1641,7 @@ func (s *GenericScraper) Search(ctx context.Context, pw *playwright.Playwright, 
     var config map[string]interface{}
     searchInputSelector := "input[type='search'], input[name='q'], input[name='query'], input[name='search']"
     searchButtonSelector := "button[type='submit'], input[type='submit'], button:has-text('Search')"
-    
+
     if s.Config != "" {
         if err := json.Unmarshal([]byte(s.Config), &config); err != nil {
             log.Printf("Failed to parse config: %v\n", err)
@@ -1625,7 +1656,7 @@ func (s *GenericScraper) Search(ctx context.Context, pw *playwright.Playwright, 
     }
 
     log.Printf("Looking for search input with selector: %s\n", searchInputSelector)
-    
+
     // Find and fill the search input
     searchInput := page.Locator(searchInputSelector).First()
     if err := searchInput.WaitFor(playwright.LocatorWaitForOptions{
@@ -1645,7 +1676,7 @@ func (s *GenericScraper) Search(ctx context.Context, pw *playwright.Playwright, 
 
     // Click the search button with timeout
     searchButton := page.Locator(searchButtonSelector).First()
-    
+
     // Wait for button to be visible with timeout
     if err := searchButton.WaitFor(playwright.LocatorWaitForOptions{
         State:   playwright.WaitForSelectorStateVisible,
@@ -1688,11 +1719,11 @@ func (s *GenericScraper) Search(ctx context.Context, pw *playwright.Playwright, 
     timestamp := time.Now().Unix()
     screenshotPath := fmt.Sprintf("data/screenshots/%s_%d.png", url.QueryEscape(s.URL), timestamp)
     htmlPath := fmt.Sprintf("data/html/%s_%d.html", url.QueryEscape(s.URL), timestamp)
-    
+
     // Create directories if they don't exist
     os.MkdirAll("data/screenshots", 0755)
     os.MkdirAll("data/html", 0755)
-    
+
     // Save screenshot
     if _, err := page.Screenshot(playwright.PageScreenshotOptions{
         Path: playwright.String(screenshotPath),
@@ -1702,7 +1733,7 @@ func (s *GenericScraper) Search(ctx context.Context, pw *playwright.Playwright, 
     } else {
         log.Printf("Saved screenshot: %s\n", screenshotPath)
     }
-    
+
     // Save HTML
     htmlContent, err := page.Content()
     if err != nil {
@@ -1718,7 +1749,7 @@ func (s *GenericScraper) Search(ctx context.Context, pw *playwright.Playwright, 
     // Parse config for link selector and extraction sequence
     var linkSelector string = "a" // default
     var extractionSteps []interface{}
-    
+
     if s.Config != "" && config != nil {
         // Check if config has a link selector
         if sel, ok := config["linkSelector"].(string); ok && sel != "" {
@@ -1759,7 +1790,7 @@ func (s *GenericScraper) Search(ctx context.Context, pw *playwright.Playwright, 
         }
 
         text = strings.TrimSpace(text)
-        
+
         // Skip navigation/short links - torrent titles are usually longer
         if len(text) < 10 {
             continue
@@ -1767,7 +1798,7 @@ func (s *GenericScraper) Search(ctx context.Context, pw *playwright.Playwright, 
 
         // Skip common navigation text
         lowerText := strings.ToLower(text)
-        if lowerText == "home" || lowerText == "login" || lowerText == "register" || 
+        if lowerText == "home" || lowerText == "login" || lowerText == "register" ||
            lowerText == "about" || lowerText == "contact" || lowerText == "privacy" ||
            lowerText == "terms of service" || lowerText == "dmca" || strings.HasPrefix(lowerText, "page ") {
             continue
@@ -1789,7 +1820,7 @@ func (s *GenericScraper) Search(ctx context.Context, pw *playwright.Playwright, 
             log.Printf("Skipping malformed URL for %q: %v\n", text, err)
             continue
         }
-        
+
         // Use the parsed URL's string representation (properly encoded)
         href = parsedURL.String()
 
@@ -1797,17 +1828,17 @@ func (s *GenericScraper) Search(ctx context.Context, pw *playwright.Playwright, 
         if seen[href] {
             continue
         }
-        
+
         log.Printf("Cached link: title=%q url=%s\n", text, href)
         seen[href] = true
         linkDataList = append(linkDataList, LinkData{Href: href, Text: text})
     }
-    
+
     log.Printf("Cached %d links from search results page (will process until matches found)\n", len(linkDataList))
 
     // Second pass: Process cached links and extract magnet links from detail pages
     results := []SearchResult{}
-    
+
     // Just return cached search results WITHOUT magnet links
     // Worker will extract magnet links only for confirmed matches
     for _, linkData := range linkDataList {
@@ -1834,7 +1865,7 @@ func extractMagnetLinkFromURL(pw *playwright.Playwright, detailURL string) (stri
         log.Printf("Failed to parse URL %q: %v\n", detailURL, err)
         return "", fmt.Errorf("invalid URL: %v", err)
     }
-    
+
     // Get the properly encoded URL string
     encodedURL := parsedURL.String()
     log.Printf("Navigating to detail page (encoded): %s\n", encodedURL)
@@ -1865,29 +1896,72 @@ func extractMagnetLinkFromURL(pw *playwright.Playwright, detailURL string) (stri
     timestamp := time.Now().Unix()
     screenshotPath := fmt.Sprintf("data/screenshots/magnet_%s_%d.png", url.QueryEscape(detailURL), timestamp)
     htmlPath := fmt.Sprintf("data/html/magnet_%s_%d.html", url.QueryEscape(detailURL), timestamp)
-    
+
     os.MkdirAll("data/screenshots", 0755)
     os.MkdirAll("data/html", 0755)
-    
+
     page.Screenshot(playwright.PageScreenshotOptions{
         Path: playwright.String(screenshotPath),
         FullPage: playwright.Bool(true),
     })
-    
+
     htmlContent, _ := page.Content()
     os.WriteFile(htmlPath, []byte(htmlContent), 0644)
-    
+
     log.Printf("Saved magnet extraction debug files: %s, %s\n", screenshotPath, htmlPath)
 
-    // Look for magnet link
+    // Look for magnet link - try direct magnet links first
     magnetLocator := page.Locator("a:has-text('Magnet Link'), a:has-text('Magnet Download'), a[href^='magnet:']").First()
     magnetLink, err := magnetLocator.GetAttribute("href")
-    if err != nil || magnetLink == "" {
-        return "", fmt.Errorf("magnet link not found")
+    
+    // If direct magnet link found, return it
+    if err == nil && magnetLink != "" && strings.HasPrefix(magnetLink, "magnet:") {
+        log.Printf("Extracted direct magnet link from %s: %s\n", detailURL, magnetLink)
+        return magnetLink, nil
+    }
+    
+    // For BT4G and similar sites, look for keepshare.org links that contain encoded magnet links
+    keepshareLocator := page.Locator("a[href*='keepshare.org']").First()
+    keepshareURL, err := keepshareLocator.GetAttribute("href")
+    if err == nil && keepshareURL != "" {
+        // The magnet link is URL-encoded in the keepshare URL path
+        // Format: //keepshare.org/16b6v173/magnet:%3Fxt=urn:btih:...
+        if strings.Contains(keepshareURL, "magnet:") {
+            // Extract and decode the magnet link
+            parts := strings.Split(keepshareURL, "/magnet:")
+            if len(parts) >= 2 {
+                encodedMagnet := "magnet:" + parts[1]
+                // URL decode it
+                decodedMagnet, err := url.QueryUnescape(encodedMagnet)
+                if err == nil && decodedMagnet != "" {
+                    log.Printf("Extracted magnet link from keepshare URL %s: %s\n", detailURL, decodedMagnet)
+                    return decodedMagnet, nil
+                }
+            }
+        }
+    }
+    
+    // Try looking for any link with magnet: in href as last resort
+    anyMagnetLocator := page.Locator("a[href*='magnet:']").First()
+    anyMagnetLink, err := anyMagnetLocator.GetAttribute("href")
+    if err == nil && anyMagnetLink != "" {
+        if strings.HasPrefix(anyMagnetLink, "magnet:") {
+            log.Printf("Extracted magnet link (fallback) from %s: %s\n", detailURL, anyMagnetLink)
+            return anyMagnetLink, nil
+        }
+        // Try to extract magnet from URL-encoded link
+        if strings.Contains(anyMagnetLink, "magnet:") || strings.Contains(anyMagnetLink, "magnet%3A") {
+            decoded, _ := url.QueryUnescape(anyMagnetLink)
+            if strings.Contains(decoded, "magnet:") {
+                magnetStart := strings.Index(decoded, "magnet:")
+                magnetPart := decoded[magnetStart:]
+                log.Printf("Extracted decoded magnet link from %s: %s\n", detailURL, magnetPart)
+                return magnetPart, nil
+            }
+        }
     }
 
-    log.Printf("Extracted magnet link from %s: %s\n", detailURL, magnetLink)
-    return magnetLink, nil
+    return "", fmt.Errorf("magnet link not found")
 }
 
 // extractTorrentURL follows config-driven steps to extract the actual torrent URL
