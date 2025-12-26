@@ -1892,23 +1892,23 @@ func extractMagnetLinkFromURL(pw *playwright.Playwright, detailURL string) (stri
         return "", fmt.Errorf("navigation failed: %v", err)
     }
 
-    // Save screenshot and HTML for debugging
-    timestamp := time.Now().Unix()
-    screenshotPath := fmt.Sprintf("data/screenshots/magnet_%s_%d.png", url.QueryEscape(detailURL), timestamp)
-    htmlPath := fmt.Sprintf("data/html/magnet_%s_%d.html", url.QueryEscape(detailURL), timestamp)
+    // Save screenshot and HTML for debugging (disabled for performance)
+    // timestamp := time.Now().Unix()
+    // screenshotPath := fmt.Sprintf("data/screenshots/magnet_%s_%d.png", url.QueryEscape(detailURL), timestamp)
+    // htmlPath := fmt.Sprintf("data/html/magnet_%s_%d.html", url.QueryEscape(detailURL), timestamp)
 
-    os.MkdirAll("data/screenshots", 0755)
-    os.MkdirAll("data/html", 0755)
+    // os.MkdirAll("data/screenshots", 0755)
+    // os.MkdirAll("data/html", 0755)
 
-    page.Screenshot(playwright.PageScreenshotOptions{
-        Path: playwright.String(screenshotPath),
-        FullPage: playwright.Bool(true),
-    })
+    // page.Screenshot(playwright.PageScreenshotOptions{
+    //     Path: playwright.String(screenshotPath),
+    //     FullPage: playwright.Bool(true),
+    // })
 
-    htmlContent, _ := page.Content()
-    os.WriteFile(htmlPath, []byte(htmlContent), 0644)
+    // htmlContent, _ := page.Content()
+    // os.WriteFile(htmlPath, []byte(htmlContent), 0644)
 
-    log.Printf("Saved magnet extraction debug files: %s, %s\n", screenshotPath, htmlPath)
+    // log.Printf("Saved magnet extraction debug files: %s, %s\n", screenshotPath, htmlPath)
 
     // Look for magnet link - try direct magnet links first
     magnetLocator := page.Locator("a:has-text('Magnet Link'), a:has-text('Magnet Download'), a[href^='magnet:']").First()

@@ -21,15 +21,15 @@ pg_dump "$DB_NAME" > "$BACKUP_FILE"
 if [ $? -eq 0 ]; then
     echo "Backup completed successfully!"
     echo "File size: $(du -h "$BACKUP_FILE" | cut -f1)"
-    
+
     # Optional: Compress the backup
     gzip "$BACKUP_FILE"
     echo "Backup compressed: ${BACKUP_FILE}.gz"
-    
+
     # Optional: Keep only last 7 backups
     echo "Cleaning up old backups (keeping last 7)..."
     ls -t "${BACKUP_DIR}"/torrent_seeker_*.sql.gz | tail -n +8 | xargs -r rm
-    
+
     echo "Done!"
 else
     echo "Backup failed!"
