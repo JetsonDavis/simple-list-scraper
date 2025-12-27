@@ -185,17 +185,17 @@ func main() {
     mux.HandleFunc("/api/auth/register", registerHandler)
     mux.HandleFunc("/api/auth/verify", verifyHandler)
     
-    // TEMPORARILY DISABLED AUTHENTICATION - All routes open for debugging
-    mux.HandleFunc("/api/items", itemsHandler)
-    mux.HandleFunc("/api/items/", itemHandler)
-    mux.HandleFunc("/api/urls", urlsHandler)
-    mux.HandleFunc("/api/urls/", urlHandler)
-    mux.HandleFunc("/api/matches", matchesHandler)
-    mux.HandleFunc("/api/matches/", matchHandler)
-    mux.HandleFunc("/api/logs", logsHandler)
-    mux.HandleFunc("/api/trigger-worker", triggerWorkerHandler)
-    mux.HandleFunc("/api/worker-status", workerStatusHandler)
-    mux.HandleFunc("/api/test-sms", testSMSHandler)
+    // Protected routes (require authentication)
+    mux.HandleFunc("/api/items", authMiddleware(itemsHandler))
+    mux.HandleFunc("/api/items/", authMiddleware(itemHandler))
+    mux.HandleFunc("/api/urls", authMiddleware(urlsHandler))
+    mux.HandleFunc("/api/urls/", authMiddleware(urlHandler))
+    mux.HandleFunc("/api/matches", authMiddleware(matchesHandler))
+    mux.HandleFunc("/api/matches/", authMiddleware(matchHandler))
+    mux.HandleFunc("/api/logs", authMiddleware(logsHandler))
+    mux.HandleFunc("/api/trigger-worker", authMiddleware(triggerWorkerHandler))
+    mux.HandleFunc("/api/worker-status", authMiddleware(workerStatusHandler))
+    mux.HandleFunc("/api/test-sms", authMiddleware(testSMSHandler))
     mux.HandleFunc("/api/ws", wsHandler)
     mux.HandleFunc("/api/health", func(w http.ResponseWriter, r *http.Request) {
         writeJSON(w, map[string]any{"status": "ok"})
@@ -1571,17 +1571,18 @@ func triggerWorkerHandler(w http.ResponseWriter, r *http.Request) {
 }
 
 func wsHandler(w http.ResponseWriter, r *http.Request) {
-    // TEMPORARILY DISABLED: Token validation for WebSocket
-    // tokenString := r.URL.Query().Get("token")
-    // if tokenString == "" {
-    //     http.Error(w, "Token required", http.StatusUnauthorized)
-    //     return
-    // }
-    // _, err := validateToken(tokenString)
-    // if err != nil {
-    //     http.Error(w, "Invalid token", http.StatusUnauthorized)
-    //     return
-    // }
+    // Validate token from query parameter for WebSocket
+    tokenString := r.URL.Query().Get("token")
+    if tokenString == "" {
+        http.Error(w, "Token required", http.StatusUnauthorized)
+        return
+    }
+
+    _, err := validateToken(tokenString)
+    if err != nil {
+        http.Error(w, "Invalid token", http.StatusUnauthorized)
+        return
+    }
 
     conn, err := wsUpgrader.Upgrade(w, r, nil)
     if err != nil {
