@@ -7,13 +7,23 @@ set -e  # Exit on error
 
 CONTAINER_NAME="torrent-seeker"
 IMAGE_NAME="torrent-seeker"
-PORT="3004"
+PORT="8080"
 
 # Colors for output
 RED='\033[0;31m'
 GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
 NC='\033[0m' # No Color
+
+# Load environment variables from .env file if it exists
+if [ -f "backend/.env" ]; then
+    echo -e "${YELLOW}Loading environment variables from backend/.env${NC}"
+    set -a  # automatically export all variables
+    source backend/.env
+    set +a
+    echo -e "${GREEN}✓ Environment variables loaded${NC}"
+    echo ""
+fi
 
 echo -e "${GREEN}========================================${NC}"
 echo -e "${GREEN}Torrent Seeker Docker Build & Run${NC}"
@@ -75,7 +85,8 @@ docker run -d \
   -e TWILIO_FROM_NUMBER="${TWILIO_FROM_NUMBER:-}" \
   -e ALERT_TO_NUMBER="${ALERT_TO_NUMBER:-}" \
   -e OLLAMA_MODEL="${OLLAMA_MODEL:-llama2}" \
-  -e OLLAMA_BASE_URL="${OLLAMA_BASE_URL:-http://localhost:11434}" \
+  -e OLLAMA_URL="${OLLAMA_URL:-http://host.docker.internal:11434}" \
+  -e JWT_SECRET="${JWT_SECRET:-}" \
   -v "$(pwd)/backend/data:/app/data" \
   ${IMAGE_NAME}
 

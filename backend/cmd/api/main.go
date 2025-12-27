@@ -23,6 +23,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/golang-jwt/jwt/v5"
 	"github.com/gorilla/websocket"
 	_ "github.com/lib/pq"
 	"github.com/lithammer/fuzzysearch/fuzzy"
@@ -40,6 +41,7 @@ var (
             return true // Allow all origins for development
         },
     }
+    jwtSecret     []byte
 )
 
 type Item struct {
@@ -88,6 +90,34 @@ type SiteScraper interface {
     Search(ctx context.Context, pw *playwright.Playwright, query string) ([]SearchResult, error)
 }
 
+type User struct {
+    ID           int64     `json:"id"`
+    Username     string    `json:"username"`
+    PasswordHash string    `json:"-"` // Never send password hash to client
+    CreatedAt    time.Time `json:"created_at"`
+}
+
+type LoginRequest struct {
+    Username string `json:"username"`
+    Password string `json:"password"`
+}
+
+type RegisterRequest struct {
+    Username string `json:"username"`
+    Password string `json:"password"`
+}
+
+type AuthResponse struct {
+    Token    string `json:"token"`
+    Username string `json:"username"`
+}
+
+type Claims struct {
+    UserID   int64  `json:"user_id"`
+    Username string `json:"username"`
+    jwt.RegisteredClaims
+}
+
 func main() {
     dbURL := os.Getenv("DATABASE_URL")
     if dbURL == "" {
@@ -113,6 +143,9 @@ func main() {
     if err := initDB(db); err != nil {
         log.Fatal(err)
     }
+
+    // Initialize JWT secret
+    jwtSecret = initJWTSecret()
 
     // Check Ollama availability if entity matching is enabled
     useEntityMatching := strings.ToLower(os.Getenv("USE_ENTITY_MATCHING")) == "true"
@@ -147,6 +180,12 @@ func main() {
     go scheduler(interval, runOnStart == "true")
 
     mux := http.NewServeMux()
+    // Authentication routes (no auth required)
+    mux.HandleFunc("/api/auth/login", loginHandler)
+    mux.HandleFunc("/api/auth/register", registerHandler)
+    mux.HandleFunc("/api/auth/verify", verifyHandler)
+    
+    // TEMPORARILY DISABLED AUTHENTICATION - All routes open for debugging
     mux.HandleFunc("/api/items", itemsHandler)
     mux.HandleFunc("/api/items/", itemHandler)
     mux.HandleFunc("/api/urls", urlsHandler)
@@ -156,6 +195,7 @@ func main() {
     mux.HandleFunc("/api/logs", logsHandler)
     mux.HandleFunc("/api/trigger-worker", triggerWorkerHandler)
     mux.HandleFunc("/api/worker-status", workerStatusHandler)
+    mux.HandleFunc("/api/test-sms", testSMSHandler)
     mux.HandleFunc("/api/ws", wsHandler)
     mux.HandleFunc("/api/health", func(w http.ResponseWriter, r *http.Request) {
         writeJSON(w, map[string]any{"status": "ok"})
@@ -337,7 +377,8 @@ func runWorker() {
 
                 // Check if this URL was previously soft-deleted for this item
                 if softDeletedURLs[r.URL] {
-                    log.Printf("SOFT_DELETED_SKIP site=%s url=%s title=%q - previously hidden by user\n", s.Name(), r.URL, r.Title)
+                    matchesFound++
+                    log.Printf("SOFT_DELETED_SKIP site=%s url=%s title=%q - previously hidden by user (match %d/%d)\n", s.Name(), r.URL, r.Title, matchesFound, maxMatchesPerItem)
                     continue
                 }
 
@@ -478,7 +519,7 @@ func runWorker() {
                 }
 
                 log.Printf("Attempting to insert match with magnet_link=%q\n", magnetLink)
-                inserted, err := insertMatchWithEntities(it.ID, r.Title, r.URL, s.Name(), r.Title, magnetLink, entitiesJSON)
+                matchID, inserted, err := insertMatchWithEntities(it.ID, r.Title, r.URL, s.Name(), r.Title, magnetLink, entitiesJSON)
                 if err != nil {
                     log.Printf("insert match error: %v\n", err)
                     continue
@@ -488,12 +529,27 @@ func runWorker() {
                     log.Printf("MATCH site=%s item=%q title=%q url=%s magnet=%q (match %d/%d)\n",
                         s.Name(), it.Text, r.Title, r.URL, magnetLink, matchesFound, maxMatchesPerItem)
 
-                    // Broadcast new match via WebSocket
+                    // Extract file size from entities for WebSocket broadcast
+                    var fileSize string
+                    var entities []Entity
+                    if err := json.Unmarshal(entitiesJSON, &entities); err == nil {
+                        for _, entity := range entities {
+                            if strings.ToUpper(entity.Type) == "FILE SIZE" || strings.ToUpper(entity.Type) == "FILESIZE" {
+                                fileSize = entity.Text
+                                break
+                            }
+                        }
+                    }
+
+                    // Broadcast new match via WebSocket with ID and file_size
                     broadcastNewMatch(map[string]any{
+                        "id":           matchID,
                         "item":         it.Text,
                         "url":          r.URL,
                         "site":         s.Name(),
                         "torrent_text": r.Title,
+                        "magnet_link":  magnetLink,
+                        "file_size":    fileSize,
                         "created":      time.Now().Format(time.RFC3339),
                     })
 
@@ -891,7 +947,7 @@ func insertMatchDedup(itemID int64, matchedText, matchedURL, sourceSite, torrent
     return n > 0, nil
 }
 
-func insertMatchWithEntities(itemID int64, matchedText, matchedURL, sourceSite, torrentText, magnetLink string, entitiesJSON []byte) (bool, error) {
+func insertMatchWithEntities(itemID int64, matchedText, matchedURL, sourceSite, torrentText, magnetLink string, entitiesJSON []byte) (int64, bool, error) {
     // Extract file size from entities
     var fileSize string
     var entities []Entity
@@ -905,16 +961,22 @@ func insertMatchWithEntities(itemID int64, matchedText, matchedURL, sourceSite, 
     }
 
     // ON CONFLICT DO NOTHING provides dedupe via unique index (item_id, matched_url, source_site)
-    res, err := db.Exec(`
+    var insertedID int64
+    err := db.QueryRow(`
         INSERT INTO matches(item_id, matched_text, matched_url, source_site, torrent_text, magnet_link, entities, file_size)
         VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
         ON CONFLICT (item_id, matched_url, source_site) DO NOTHING
-    `, itemID, matchedText, matchedURL, sourceSite, torrentText, magnetLink, entitiesJSON, fileSize)
+        RETURNING id
+    `, itemID, matchedText, matchedURL, sourceSite, torrentText, magnetLink, entitiesJSON, fileSize).Scan(&insertedID)
+    
     if err != nil {
-        return false, err
+        if err == sql.ErrNoRows {
+            // Conflict occurred, no row inserted
+            return 0, false, nil
+        }
+        return 0, false, err
     }
-    n, _ := res.RowsAffected()
-    return n > 0, nil
+    return insertedID, true, nil
 }
 
 func loadSoftDeletedURLs(itemID int64) (map[string]bool, error) {
@@ -986,6 +1048,84 @@ func maybeSendTwilioSMS(itemText, matchedTitle, matchedURL, site string) error {
         return fmt.Errorf("twilio status: %s", resp.Status)
     }
     return nil
+}
+
+func sendTwilioSMS(to, message string) error {
+    sid := strings.TrimSpace(os.Getenv("TWILIO_ACCOUNT_SID"))
+    tok := strings.TrimSpace(os.Getenv("TWILIO_AUTH_TOKEN"))
+    from := strings.TrimSpace(os.Getenv("TWILIO_FROM_NUMBER"))
+    
+    if sid == "" || tok == "" || from == "" {
+        return fmt.Errorf("Twilio not configured. Set TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN, and TWILIO_FROM_NUMBER")
+    }
+
+    form := url.Values{}
+    form.Set("From", from)
+    form.Set("To", to)
+    form.Set("Body", message)
+
+    req, err := http.NewRequest("POST",
+        fmt.Sprintf("https://api.twilio.com/2010-04-01/Accounts/%s/Messages.json", sid),
+        strings.NewReader(form.Encode()),
+    )
+    if err != nil {
+        return err
+    }
+    req.SetBasicAuth(sid, tok)
+    req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+
+    client := &http.Client{Timeout: 15 * time.Second}
+    resp, err := client.Do(req)
+    if err != nil {
+        return err
+    }
+    defer resp.Body.Close()
+
+    if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+        body, _ := io.ReadAll(resp.Body)
+        return fmt.Errorf("twilio error: %s - %s", resp.Status, string(body))
+    }
+    return nil
+}
+
+func testSMSHandler(w http.ResponseWriter, r *http.Request) {
+    log.Printf("testSMSHandler called, method: %s", r.Method)
+    
+    if r.Method != http.MethodPost {
+        w.WriteHeader(http.StatusMethodNotAllowed)
+        return
+    }
+
+    to := r.FormValue("to")
+    message := r.FormValue("message")
+    
+    log.Printf("Form values - to: %q, message: %q", to, message)
+    
+    if to == "" {
+        to = strings.TrimSpace(os.Getenv("ALERT_TO_NUMBER"))
+        log.Printf("ALERT_TO_NUMBER from env: %q", to)
+        if to == "" {
+            log.Printf("No recipient specified and ALERT_TO_NUMBER not set")
+            http.Error(w, "No recipient specified and ALERT_TO_NUMBER not set", http.StatusBadRequest)
+            return
+        }
+    }
+    
+    if message == "" {
+        message = "Test message from Torrent Seeker"
+    }
+
+    log.Printf("Sending test SMS to %s: %s", to, message)
+    
+    if err := sendTwilioSMS(to, message); err != nil {
+        log.Printf("Test SMS failed: %v", err)
+        w.Header().Set("Content-Type", "text/plain")
+        http.Error(w, err.Error(), http.StatusInternalServerError)
+        return
+    }
+
+    log.Printf("Test SMS sent successfully to %s", to)
+    writeJSON(w, map[string]any{"ok": true, "message": "Test SMS sent successfully"})
 }
 
 // -------------------- API handlers --------------------
@@ -1355,7 +1495,13 @@ func matchHandler(w http.ResponseWriter, r *http.Request) {
     }
 
     idStr := strings.TrimPrefix(r.URL.Path, "/api/matches/")
-    log.Printf("DELETE /api/matches/%s - Attempting to delete match ID: %s\n", idStr, idStr)
+    hardDelete := r.URL.Query().Get("hard") == "true"
+    
+    deleteType := "soft"
+    if hardDelete {
+        deleteType = "hard"
+    }
+    log.Printf("DELETE /api/matches/%s?hard=%v - Attempting %s delete of match ID: %s\n", idStr, hardDelete, deleteType, idStr)
 
     id, err := strconv.ParseInt(idStr, 10, 64)
     if err != nil {
@@ -1364,7 +1510,15 @@ func matchHandler(w http.ResponseWriter, r *http.Request) {
         return
     }
 
-    result, err := db.Exec("UPDATE matches SET soft_delete = TRUE WHERE id=$1", id)
+    var result sql.Result
+    if hardDelete {
+        // Permanent deletion
+        result, err = db.Exec("DELETE FROM matches WHERE id=$1", id)
+    } else {
+        // Soft delete (hide)
+        result, err = db.Exec("UPDATE matches SET soft_delete = TRUE WHERE id=$1", id)
+    }
+    
     if err != nil {
         log.Printf("DELETE /api/matches/%d - Database error: %v\n", id, err)
         http.Error(w, err.Error(), http.StatusInternalServerError)
@@ -1372,7 +1526,7 @@ func matchHandler(w http.ResponseWriter, r *http.Request) {
     }
 
     rowsAffected, _ := result.RowsAffected()
-    log.Printf("DELETE /api/matches/%d - Successfully soft deleted %d row(s)\n", id, rowsAffected)
+    log.Printf("DELETE /api/matches/%d - Successfully %s deleted %d row(s)\n", id, deleteType, rowsAffected)
 
     writeJSON(w, map[string]any{"ok": true})
 }
@@ -1417,6 +1571,18 @@ func triggerWorkerHandler(w http.ResponseWriter, r *http.Request) {
 }
 
 func wsHandler(w http.ResponseWriter, r *http.Request) {
+    // TEMPORARILY DISABLED: Token validation for WebSocket
+    // tokenString := r.URL.Query().Get("token")
+    // if tokenString == "" {
+    //     http.Error(w, "Token required", http.StatusUnauthorized)
+    //     return
+    // }
+    // _, err := validateToken(tokenString)
+    // if err != nil {
+    //     http.Error(w, "Invalid token", http.StatusUnauthorized)
+    //     return
+    // }
+
     conn, err := wsUpgrader.Upgrade(w, r, nil)
     if err != nil {
         log.Printf("WebSocket upgrade error: %v", err)
@@ -1521,6 +1687,13 @@ func loggingMiddleware(next http.Handler) http.Handler {
 
 func initDB(db *sql.DB) error {
     stmts := []string{
+        `CREATE TABLE IF NOT EXISTS users (
+            id SERIAL PRIMARY KEY,
+            username TEXT NOT NULL UNIQUE,
+            password_hash TEXT NOT NULL,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        );`,
+
         `CREATE TABLE IF NOT EXISTS items (
             id SERIAL PRIMARY KEY,
             text TEXT NOT NULL,

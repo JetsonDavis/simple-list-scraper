@@ -35,9 +35,9 @@ if ! docker info 2>&1 | grep -q "Username: ${DOCKER_USERNAME}"; then
     echo ""
 fi
 
-# Build the Docker image
-echo -e "${YELLOW}Building Docker image '${DOCKER_USERNAME}/${IMAGE_NAME}:${VERSION}'...${NC}"
-docker build -t ${DOCKER_USERNAME}/${IMAGE_NAME}:${VERSION} -f deploy/Dockerfile .
+# Build the local Docker image (same as docker-run.sh)
+echo -e "${YELLOW}Building local Docker image '${IMAGE_NAME}'...${NC}"
+docker build -t ${IMAGE_NAME} -f deploy/Dockerfile .
 
 if [ $? -eq 0 ]; then
     echo -e "${GREEN}✓ Docker image built successfully${NC}"
@@ -46,11 +46,17 @@ else
     exit 1
 fi
 
+# Tag for Docker Hub
+echo ""
+echo -e "${YELLOW}Tagging image for Docker Hub as '${DOCKER_USERNAME}/${IMAGE_NAME}:${VERSION}'...${NC}"
+docker tag ${IMAGE_NAME} ${DOCKER_USERNAME}/${IMAGE_NAME}:${VERSION}
+echo -e "${GREEN}✓ Tagged for Docker Hub${NC}"
+
 # Also tag as latest if a specific version was provided
 if [ "$VERSION" != "latest" ]; then
     echo ""
     echo -e "${YELLOW}Tagging as 'latest' as well...${NC}"
-    docker tag ${DOCKER_USERNAME}/${IMAGE_NAME}:${VERSION} ${DOCKER_USERNAME}/${IMAGE_NAME}:latest
+    docker tag ${IMAGE_NAME} ${DOCKER_USERNAME}/${IMAGE_NAME}:latest
     echo -e "${GREEN}✓ Tagged as latest${NC}"
 fi
 

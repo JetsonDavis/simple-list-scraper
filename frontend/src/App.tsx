@@ -285,14 +285,35 @@ export default function App() {
     }
   }
 
+  async function testSMS() {
+    try {
+      const res = await fetch("/api/test-sms", { method: "POST" });
+      if (!res.ok) {
+        const text = await res.text();
+        alert(`Failed to send test SMS: ${text}`);
+        return;
+      }
+      const data = await res.json();
+      alert(data.message || "Test SMS sent successfully");
+    } catch (err) {
+      console.error("Error sending test SMS:", err);
+      alert("Failed to send test SMS");
+    }
+  }
+
   return (
     <div className="container">
       <div className="header">
         <h2>Torrent Seeker</h2>
-        <button onClick={triggerWorker} disabled={triggering} className="run-button">
-          {triggering && <span className="spinner"></span>}
-          {triggering ? "Running..." : "Run"}
-        </button>
+        <div style={{ display: 'flex', gap: '12px' }}>
+          <button onClick={testSMS} className="run-button" style={{ padding: '8px 16px', fontSize: '14px' }}>
+            Test SMS
+          </button>
+          <button onClick={triggerWorker} disabled={triggering} className="run-button" style={{ padding: '8px 16px', fontSize: '14px' }}>
+            {triggering && <span className="spinner"></span>}
+            {triggering ? "Running..." : "Run"}
+          </button>
+        </div>
       </div>
 
       <div className="tabs">
