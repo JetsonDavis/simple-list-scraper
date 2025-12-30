@@ -2,7 +2,7 @@
 //  MatchesView.swift
 //  TorrentSeeker
 //
-//  Matches tab view matching the React frontend
+//  Matches tab view with mobile-friendly card layout
 //
 
 import SwiftUI
@@ -13,72 +13,16 @@ struct MatchesView: View {
     let borderColor = Color(red: 0.882, green: 0.882, blue: 0.882)
 
     var body: some View {
-        VStack(spacing: 0) {
-            // Table header
-            HStack(spacing: 8) {
-                Text("ITEM")
-                    .font(.system(size: 13, weight: .semibold))
-                    .foregroundColor(Color(red: 0.376, green: 0.369, blue: 0.361))
-                    .frame(width: 120, alignment: .leading)
-
-                Text("SITE")
-                    .font(.system(size: 13, weight: .semibold))
-                    .foregroundColor(Color(red: 0.376, green: 0.369, blue: 0.361))
-                    .frame(width: 80, alignment: .leading)
-
-                Text("TORRENT TEXT")
-                    .font(.system(size: 13, weight: .semibold))
-                    .foregroundColor(Color(red: 0.376, green: 0.369, blue: 0.361))
-                    .frame(maxWidth: .infinity, alignment: .leading)
-
-                Text("SIZE")
-                    .font(.system(size: 13, weight: .semibold))
-                    .foregroundColor(Color(red: 0.376, green: 0.369, blue: 0.361))
-                    .frame(width: 60, alignment: .center)
-
-                Text("MAGNET")
-                    .font(.system(size: 13, weight: .semibold))
-                    .foregroundColor(Color(red: 0.376, green: 0.369, blue: 0.361))
-                    .frame(width: 60, alignment: .center)
-
-                Text("WHEN")
-                    .font(.system(size: 13, weight: .semibold))
-                    .foregroundColor(Color(red: 0.376, green: 0.369, blue: 0.361))
-                    .frame(width: 100, alignment: .leading)
-
-                Text("ACTIONS")
-                    .font(.system(size: 13, weight: .semibold))
-                    .foregroundColor(Color(red: 0.376, green: 0.369, blue: 0.361))
-                    .frame(width: 80, alignment: .center)
-            }
-            .padding(12)
-            .background(Color(red: 0.953, green: 0.949, blue: 0.945))
-            .overlay(
-                Rectangle()
-                    .frame(height: 2)
-                    .foregroundColor(borderColor),
-                alignment: .bottom
-            )
-
-            // Table rows
-            ScrollView {
-                LazyVStack(spacing: 0) {
-                    ForEach(matches) { match in
-                        MatchRow(match: match, onSoftDelete: {
-                            softDeleteMatch(id: match.id)
-                        }, onHardDelete: {
-                            hardDeleteMatch(id: match.id)
-                        })
-                    }
-                }
+        VStack(alignment: .leading, spacing: 12) {
+            // Matches list with card layout
+            ForEach(matches) { match in
+                MatchCard(match: match, onSoftDelete: {
+                    softDeleteMatch(id: match.id)
+                }, onHardDelete: {
+                    hardDeleteMatch(id: match.id)
+                })
             }
         }
-        .background(Color.white)
-        .cornerRadius(4)
-        .overlay(
-            RoundedRectangle(cornerRadius: 4)
-                .stroke(borderColor, lineWidth: 1)
-        )
     }
 
     func softDeleteMatch(id: Int) {
@@ -104,7 +48,7 @@ struct MatchesView: View {
     }
 }
 
-struct MatchRow: View {
+struct MatchCard: View {
     let match: Match
     let onSoftDelete: () -> Void
     let onHardDelete: () -> Void
@@ -112,91 +56,139 @@ struct MatchRow: View {
     let azureBlue = Color(red: 0.0, green: 0.47, blue: 0.831)
 
     var body: some View {
-        HStack(spacing: 8) {
-            // Item
-            Text(match.item)
-                .font(.system(size: 14))
-                .frame(width: 120, alignment: .leading)
-                .lineLimit(2)
+        VStack(alignment: .leading, spacing: 8) {
+            // Actions row at top
+            HStack {
+                Spacer()
 
-            // Site
-            Text(match.site)
-                .font(.system(size: 14))
-                .frame(width: 80, alignment: .leading)
-                .lineLimit(1)
-
-            // Torrent text (with link)
-            if let urlString = Foundation.URL(string: match.url) {
-                Link(destination: urlString) {
-                    Text(match.torrentText ?? match.url)
-                        .font(.system(size: 14))
-                        .foregroundColor(azureBlue)
-                        .frame(maxWidth: .infinity, alignment: .leading)
-                        .lineLimit(2)
-                }
-            } else {
-                Text(match.torrentText ?? match.url)
-                    .font(.system(size: 14))
-                    .frame(maxWidth: .infinity, alignment: .leading)
-                    .lineLimit(2)
-            }
-
-            // Size
-            Text(match.fileSize ?? "-")
-                .font(.system(size: 13))
-                .foregroundColor(Color(red: 0.376, green: 0.369, blue: 0.361))
-                .frame(width: 60, alignment: .center)
-
-            // Magnet link
-            if let magnetLink = match.magnetLink,
-               let magnetURL = Foundation.URL(string: magnetLink) {
-                Link(destination: magnetURL) {
-                    Image(systemName: "arrow.down.circle")
-                        .foregroundColor(azureBlue)
-                        .frame(width: 18, height: 18)
-                }
-                .frame(width: 60, alignment: .center)
-            } else {
-                Text("-")
-                    .font(.system(size: 14))
-                    .foregroundColor(Color.gray)
-                    .frame(width: 60, alignment: .center)
-            }
-
-            // When
-            Text(match.created)
-                .font(.system(size: 13))
-                .frame(width: 100, alignment: .leading)
-                .lineLimit(1)
-
-            // Actions
-            HStack(spacing: 4) {
                 // Soft delete (hide)
                 Button(action: onSoftDelete) {
-                    Image(systemName: "eye.slash")
-                        .foregroundColor(Color.orange)
-                        .frame(width: 18, height: 18)
+                    HStack(spacing: 4) {
+                        Image(systemName: "eye.slash")
+                        Text("Hide")
+                            .font(.system(size: 12))
+                    }
+                    .foregroundColor(.white)
+                    .padding(.horizontal, 10)
+                    .padding(.vertical, 6)
+                    .background(Color.orange)
+                    .cornerRadius(4)
                 }
-                .buttonStyle(PlainButtonStyle())
 
                 // Hard delete
                 Button(action: onHardDelete) {
-                    Image(systemName: "trash")
-                        .foregroundColor(Color(red: 0.82, green: 0.2, blue: 0.22))
-                        .frame(width: 18, height: 18)
+                    HStack(spacing: 4) {
+                        Image(systemName: "trash")
+                        Text("Delete")
+                            .font(.system(size: 12))
+                    }
+                    .foregroundColor(.white)
+                    .padding(.horizontal, 10)
+                    .padding(.vertical, 6)
+                    .background(Color(red: 0.82, green: 0.2, blue: 0.22))
+                    .cornerRadius(4)
                 }
-                .buttonStyle(PlainButtonStyle())
             }
-            .frame(width: 80, alignment: .center)
+
+            // Item
+            VStack(alignment: .leading, spacing: 2) {
+                Text("ITEM")
+                    .font(.system(size: 11, weight: .semibold))
+                    .foregroundColor(Color(red: 0.376, green: 0.369, blue: 0.361))
+
+                Text(match.item)
+                    .font(.system(size: 13))
+                    .foregroundColor(.primary)
+            }
+
+            // Site
+            VStack(alignment: .leading, spacing: 2) {
+                Text("SITE")
+                    .font(.system(size: 11, weight: .semibold))
+                    .foregroundColor(Color(red: 0.376, green: 0.369, blue: 0.361))
+
+                Text(match.site)
+                    .font(.system(size: 13))
+                    .foregroundColor(.primary)
+            }
+
+            // Torrent text with link
+            VStack(alignment: .leading, spacing: 2) {
+                Text("TORRENT TEXT")
+                    .font(.system(size: 11, weight: .semibold))
+                    .foregroundColor(Color(red: 0.376, green: 0.369, blue: 0.361))
+
+                if let urlString = Foundation.URL(string: match.url) {
+                    Link(destination: urlString) {
+                        Text(match.torrentText ?? match.url)
+                            .font(.system(size: 13))
+                            .foregroundColor(azureBlue)
+                            .underline()
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
+                } else {
+                    Text(match.torrentText ?? match.url)
+                        .font(.system(size: 13))
+                        .foregroundColor(.primary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+            }
+
+            // Size and Magnet in a row
+            HStack(spacing: 20) {
+                // Size
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("SIZE")
+                        .font(.system(size: 11, weight: .semibold))
+                        .foregroundColor(Color(red: 0.376, green: 0.369, blue: 0.361))
+
+                    Text(match.fileSize ?? "-")
+                        .font(.system(size: 13))
+                        .foregroundColor(.primary)
+                }
+
+                // Magnet link
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("MAGNET")
+                        .font(.system(size: 11, weight: .semibold))
+                        .foregroundColor(Color(red: 0.376, green: 0.369, blue: 0.361))
+
+                    if let magnetLink = match.magnetLink,
+                       let magnetURL = Foundation.URL(string: magnetLink) {
+                        Link(destination: magnetURL) {
+                            HStack(spacing: 4) {
+                                Image(systemName: "arrow.down.circle")
+                                Text("Download")
+                                    .font(.system(size: 12))
+                            }
+                            .foregroundColor(azureBlue)
+                        }
+                    } else {
+                        Text("-")
+                            .font(.system(size: 13))
+                            .foregroundColor(Color.gray)
+                    }
+                }
+            }
+
+            // When
+            VStack(alignment: .leading, spacing: 2) {
+                Text("WHEN")
+                    .font(.system(size: 11, weight: .semibold))
+                    .foregroundColor(Color(red: 0.376, green: 0.369, blue: 0.361))
+
+                Text(match.created)
+                    .font(.system(size: 13))
+                    .foregroundColor(.primary)
+            }
         }
-        .padding(.vertical, 8)
-        .padding(.horizontal, 12)
+        .padding(12)
+        .frame(maxWidth: .infinity, alignment: .leading)
         .background(Color.white)
+        .cornerRadius(4)
         .overlay(
-            Rectangle()
-                .frame(height: 1)
-                .foregroundColor(Color(red: 0.953, green: 0.949, blue: 0.945)),
-            alignment: .bottom
+            RoundedRectangle(cornerRadius: 4)
+                .stroke(Color(red: 0.882, green: 0.882, blue: 0.882), lineWidth: 1)
         )
     }
 }

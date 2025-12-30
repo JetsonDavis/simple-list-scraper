@@ -8,7 +8,7 @@
 import SwiftUI
 
 struct URLsView: View {
-    @Binding var urls: [URL]
+    @Binding var urls: [SiteURL]
     @State private var newURLText = ""
 
     let azureBlue = Color(red: 0.0, green: 0.47, blue: 0.831)
@@ -37,52 +37,14 @@ struct URLsView: View {
                 }
             }
 
-            // URLs table
-            VStack(spacing: 0) {
-                // Table header
-                HStack {
-                    Text("Display Name")
-                        .font(.system(size: 13, weight: .semibold))
-                        .foregroundColor(Color(red: 0.376, green: 0.369, blue: 0.361))
-                        .frame(width: 200, alignment: .leading)
-                        .textCase(.uppercase)
-
-                    Text("URL")
-                        .font(.system(size: 13, weight: .semibold))
-                        .foregroundColor(Color(red: 0.376, green: 0.369, blue: 0.361))
-                        .frame(maxWidth: .infinity, alignment: .leading)
-                        .textCase(.uppercase)
-
-                    Text("Actions")
-                        .font(.system(size: 13, weight: .semibold))
-                        .foregroundColor(Color(red: 0.376, green: 0.369, blue: 0.361))
-                        .frame(width: 100, alignment: .center)
-                        .textCase(.uppercase)
-                }
-                .padding(12)
-                .background(Color(red: 0.953, green: 0.949, blue: 0.945))
-                .overlay(
-                    Rectangle()
-                        .frame(height: 2)
-                        .foregroundColor(borderColor),
-                    alignment: .bottom
-                )
-
-                // Table rows
-                ForEach(urls) { url in
-                    URLRow(url: url, onDelete: {
-                        deleteURL(id: url.id)
-                    }, onUpdate: { newURL, newDisplayName in
-                        updateURL(id: url.id, url: newURL, displayName: newDisplayName)
-                    })
-                }
+            // URLs list with card layout
+            ForEach(urls) { url in
+                URLCard(url: url, onDelete: {
+                    deleteURL(id: url.id)
+                }, onUpdate: { newURL, newDisplayName in
+                    updateURL(id: url.id, url: newURL, displayName: newDisplayName)
+                })
             }
-            .background(Color.white)
-            .cornerRadius(4)
-            .overlay(
-                RoundedRectangle(cornerRadius: 4)
-                    .stroke(borderColor, lineWidth: 1)
-            )
         }
     }
 
@@ -124,8 +86,8 @@ struct URLsView: View {
     }
 }
 
-struct URLRow: View {
-    let url: URL
+struct URLCard: View {
+    let url: SiteURL
     let onDelete: () -> Void
     let onUpdate: (String?, String?) -> Void
 
@@ -134,7 +96,7 @@ struct URLRow: View {
     @FocusState private var displayNameFocused: Bool
     @FocusState private var urlFocused: Bool
 
-    init(url: URL, onDelete: @escaping () -> Void, onUpdate: @escaping (String?, String?) -> Void) {
+    init(url: SiteURL, onDelete: @escaping () -> Void, onUpdate: @escaping (String?, String?) -> Void) {
         self.url = url
         self.onDelete = onDelete
         self.onUpdate = onUpdate
@@ -143,70 +105,96 @@ struct URLRow: View {
     }
 
     var body: some View {
-        HStack(spacing: 0) {
-            // Display name field
-            TextField("Display name...", text: $editDisplayName)
-                .textFieldStyle(PlainTextFieldStyle())
-                .padding(.horizontal, 8)
-                .padding(.vertical, 4)
-                .frame(width: 200)
-                .focused($displayNameFocused)
-                .onSubmit {
-                    displayNameFocused = false
-                }
-                .onChange(of: displayNameFocused) { _, focused in
-                    if !focused && editDisplayName != (url.displayName ?? "") {
-                        onUpdate(nil, editDisplayName)
-                    }
-                }
+        VStack(alignment: .leading, spacing: 8) {
+            // Actions row at top
+            HStack {
+                Spacer()
 
-            // URL field
-            TextField("", text: $editURL)
-                .textFieldStyle(PlainTextFieldStyle())
-                .padding(.horizontal, 8)
-                .padding(.vertical, 4)
-                .focused($urlFocused)
-                .onSubmit {
-                    urlFocused = false
-                }
-                .onChange(of: urlFocused) { _, focused in
-                    if !focused && editURL != url.url {
-                        onUpdate(editURL, nil)
+                // Delete button
+                Button(action: onDelete) {
+                    HStack(spacing: 4) {
+                        Image(systemName: "trash")
+                        Text("Delete")
+                            .font(.system(size: 12))
                     }
+                    .foregroundColor(.white)
+                    .padding(.horizontal, 10)
+                    .padding(.vertical, 6)
+                    .background(Color(red: 0.82, green: 0.2, blue: 0.22))
+                    .cornerRadius(4)
                 }
+            }
 
-            // Delete button
-            Button(action: onDelete) {
-                Text("Delete")
-                    .font(.system(size: 13, weight: .medium))
+            // Display Name
+            VStack(alignment: .leading, spacing: 2) {
+                Text("DISPLAY NAME")
+                    .font(.system(size: 11, weight: .semibold))
                     .foregroundColor(Color(red: 0.376, green: 0.369, blue: 0.361))
-                    .padding(.horizontal, 16)
-                    .padding(.vertical, 8)
-                    .background(Color.white)
+
+                TextField("Display name...", text: $editDisplayName)
+                    .textFieldStyle(PlainTextFieldStyle())
+                    .font(.system(size: 13))
+                    .padding(8)
+                    .background(Color(red: 0.98, green: 0.98, blue: 0.98))
                     .cornerRadius(4)
                     .overlay(
                         RoundedRectangle(cornerRadius: 4)
                             .stroke(Color(red: 0.882, green: 0.882, blue: 0.882), lineWidth: 1)
                     )
+                    .focused($displayNameFocused)
+                    .onSubmit {
+                        displayNameFocused = false
+                    }
+                    .onChange(of: displayNameFocused) { _, focused in
+                        if !focused && editDisplayName != (url.displayName ?? "") {
+                            onUpdate(nil, editDisplayName)
+                        }
+                    }
             }
-            .frame(width: 100)
-            .buttonStyle(PlainButtonStyle())
+
+            // URL
+            VStack(alignment: .leading, spacing: 2) {
+                Text("URL")
+                    .font(.system(size: 11, weight: .semibold))
+                    .foregroundColor(Color(red: 0.376, green: 0.369, blue: 0.361))
+
+                TextField("URL...", text: $editURL)
+                    .textFieldStyle(PlainTextFieldStyle())
+                    .font(.system(size: 13))
+                    .padding(8)
+                    .background(Color(red: 0.98, green: 0.98, blue: 0.98))
+                    .cornerRadius(4)
+                    .overlay(
+                        RoundedRectangle(cornerRadius: 4)
+                            .stroke(Color(red: 0.882, green: 0.882, blue: 0.882), lineWidth: 1)
+                    )
+                    .textInputAutocapitalization(.never)
+                    .autocorrectionDisabled()
+                    .focused($urlFocused)
+                    .onSubmit {
+                        urlFocused = false
+                    }
+                    .onChange(of: urlFocused) { _, focused in
+                        if !focused && editURL != url.url {
+                            onUpdate(editURL, nil)
+                        }
+                    }
+            }
         }
-        .padding(.vertical, 8)
-        .padding(.horizontal, 12)
+        .padding(12)
+        .frame(maxWidth: .infinity, alignment: .leading)
         .background(Color.white)
+        .cornerRadius(4)
         .overlay(
-            Rectangle()
-                .frame(height: 1)
-                .foregroundColor(Color(red: 0.953, green: 0.949, blue: 0.945)),
-            alignment: .bottom
+            RoundedRectangle(cornerRadius: 4)
+                .stroke(Color(red: 0.882, green: 0.882, blue: 0.882), lineWidth: 1)
         )
     }
 }
 
 #Preview {
     URLsView(urls: .constant([
-        URL(id: 1, url: "https://example.com", displayName: "Example Site", config: nil),
-        URL(id: 2, url: "https://test.com", displayName: nil, config: nil)
+        SiteURL(id: 1, url: "https://example.com", displayName: "Example Site", config: nil),
+        SiteURL(id: 2, url: "https://test.com", displayName: nil, config: nil)
     ]))
 }

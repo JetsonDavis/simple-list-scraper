@@ -17,7 +17,7 @@ struct MainView: View {
 
     @State private var selectedTab: Tab = .items
     @State private var items: [Item] = []
-    @State private var urls: [URL] = []
+    @State private var urls: [SiteURL] = []
     @State private var matches: [Match] = []
     @State private var logs: [Log] = []
     @State private var logsPage = 1
@@ -32,59 +32,30 @@ struct MainView: View {
             // Header
             HStack {
                 Text("Torrent Seeker")
-                    .font(.system(size: 24, weight: .semibold))
+                    .font(.system(size: 20, weight: .semibold))
                     .foregroundColor(.white)
 
                 Spacer()
 
-                HStack(spacing: 12) {
-                    if let username = authViewModel.username {
-                        Text(username)
-                            .font(.system(size: 14))
-                            .foregroundColor(.white)
-                    }
-
-                    Button(action: testSMS) {
-                        Text("Test SMS")
-                            .font(.system(size: 14, weight: .semibold))
-                            .foregroundColor(azureBlue)
-                            .padding(.horizontal, 16)
-                            .padding(.vertical, 8)
-                            .background(Color.white)
-                            .cornerRadius(4)
-                    }
-
-                    Button(action: triggerWorker) {
-                        HStack(spacing: 8) {
-                            if triggering {
-                                ProgressView()
-                                    .progressViewStyle(CircularProgressViewStyle(tint: azureBlue))
-                                    .scaleEffect(0.8)
-                            }
-                            Text(triggering ? "Running..." : "Run")
-                                .font(.system(size: 14, weight: .semibold))
-                        }
-                        .foregroundColor(azureBlue)
-                        .padding(.horizontal, 16)
-                        .padding(.vertical, 8)
-                        .background(Color.white)
-                        .cornerRadius(4)
-                    }
-                    .disabled(triggering)
-
-                    Button(action: logout) {
-                        Text("Logout")
-                            .font(.system(size: 14, weight: .semibold))
-                            .foregroundColor(.white)
-                            .padding(.horizontal, 16)
-                            .padding(.vertical, 8)
-                            .background(Color(red: 0.863, green: 0.208, blue: 0.271)) // #dc3545
-                            .cornerRadius(4)
-                    }
+                if let username = authViewModel.username {
+                    Text(username)
+                        .font(.system(size: 12))
+                        .foregroundColor(.white.opacity(0.9))
                 }
+
+                Button(action: logout) {
+                    Text("Logout")
+                        .font(.system(size: 13, weight: .semibold))
+                        .foregroundColor(.white)
+                        .padding(.horizontal, 12)
+                        .padding(.vertical, 6)
+                        .background(Color(red: 0.863, green: 0.208, blue: 0.271))
+                        .cornerRadius(4)
+                }
+                .padding(.leading, 12)
             }
-            .padding(.horizontal, 32)
-            .padding(.vertical, 24)
+            .padding(.horizontal, 16)
+            .padding(.vertical, 16)
             .background(azureBlue)
 
             // Tabs
@@ -101,9 +72,7 @@ struct MainView: View {
                 TabButton(title: "Logs", isActive: selectedTab == .logs) {
                     selectedTab = .logs
                 }
-                Spacer()
             }
-            .padding(.horizontal, 32)
             .background(Color(red: 0.953, green: 0.949, blue: 0.945)) // #F3F2F1
             .overlay(
                 Rectangle()
@@ -112,21 +81,33 @@ struct MainView: View {
                 alignment: .bottom
             )
 
-            // Tab content
+            // Tab content with scrolling
             ScrollView {
-                VStack(spacing: 0) {
+                LazyVStack(spacing: 0) {
                     switch selectedTab {
                     case .items:
                         ItemsView(items: $items)
+                            .padding(.horizontal, 16)
+                            .padding(.top, 12)
+                            .padding(.bottom, 32)
                     case .matches:
                         MatchesView(matches: $matches)
+                            .padding(.horizontal, 16)
+                            .padding(.top, 12)
+                            .padding(.bottom, 32)
                     case .urls:
                         URLsView(urls: $urls)
+                            .padding(.horizontal, 16)
+                            .padding(.top, 12)
+                            .padding(.bottom, 32)
                     case .logs:
                         LogsView(logs: $logs, logsPage: $logsPage, logsTotalPages: $logsTotalPages)
+                            .padding(.horizontal, 16)
+                            .padding(.top, 12)
+                            .padding(.bottom, 32)
                     }
                 }
-                .padding(32)
+                .frame(maxWidth: .infinity)
             }
             .background(Color.white)
         }
@@ -192,7 +173,7 @@ struct MainView: View {
             logs.insert(log, at: 0)
         }
 
-        webSocketService.connect(token: token)
+        webSocketService.connect(token: token, host: "99.104.116.11:8080")
     }
 
     func triggerWorker() {
@@ -239,14 +220,15 @@ struct TabButton: View {
                 Text(title)
                     .font(.system(size: 14, weight: .medium))
                     .foregroundColor(isActive ? azureBlue : textSecondary)
-                    .padding(.horizontal, 24)
                     .padding(.vertical, 14)
+                    .frame(maxWidth: .infinity)
 
                 Rectangle()
                     .frame(height: 3)
                     .foregroundColor(isActive ? azureBlue : Color.clear)
             }
         }
+        .frame(maxWidth: .infinity)
         .background(isActive ? Color.white : Color.clear)
     }
 }

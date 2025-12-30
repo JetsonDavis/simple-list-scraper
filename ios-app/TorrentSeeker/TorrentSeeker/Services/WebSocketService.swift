@@ -17,13 +17,13 @@ class WebSocketService: NSObject, ObservableObject {
     var onNewMatch: ((Match) -> Void)?
     var onNewLog: ((Log) -> Void)?
 
-    func connect(token: String, host: String = "localhost:8080") {
+    func connect(token: String, host: String = "127.0.0.1:8080") {
         self.token = token
 
         // Determine protocol based on whether we're using SSL
         let urlString = "ws://\(host)/api/ws?token=\(token)"
 
-        guard let url = URL(string: urlString) else {
+        guard let url = Foundation.URL(string: urlString) else {
             print("Invalid WebSocket URL")
             return
         }

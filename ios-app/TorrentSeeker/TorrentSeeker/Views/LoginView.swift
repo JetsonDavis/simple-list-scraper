@@ -177,12 +177,12 @@ struct LoginView: View {
                 }
             } catch APIError.serverError(let message) {
                 await MainActor.run {
-                    error = message
+                    self.error = message
                     loading = false
                 }
             } catch {
                 await MainActor.run {
-                    error = "Network error. Please try again."
+                    self.error = "Network error. Please try again."
                     loading = false
                 }
             }

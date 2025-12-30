@@ -2,7 +2,7 @@
 //  LogsView.swift
 //  TorrentSeeker
 //
-//  Logs tab view matching the React frontend
+//  Logs tab view with mobile-friendly card layout
 //
 
 import SwiftUI
@@ -30,52 +30,10 @@ struct LogsView: View {
                 }
             }
 
-            // Logs table
-            VStack(spacing: 0) {
-                // Table header
-                HStack {
-                    Text("TIMESTAMP")
-                        .font(.system(size: 13, weight: .semibold))
-                        .foregroundColor(Color(red: 0.376, green: 0.369, blue: 0.361))
-                        .frame(width: 180, alignment: .leading)
-                        .textCase(.uppercase)
-
-                    Text("DESCRIPTION")
-                        .font(.system(size: 13, weight: .semibold))
-                        .foregroundColor(Color(red: 0.376, green: 0.369, blue: 0.361))
-                        .frame(maxWidth: .infinity, alignment: .leading)
-                        .textCase(.uppercase)
-
-                    Text("STATUS")
-                        .font(.system(size: 13, weight: .semibold))
-                        .foregroundColor(Color(red: 0.376, green: 0.369, blue: 0.361))
-                        .frame(width: 100, alignment: .center)
-                        .textCase(.uppercase)
-                }
-                .padding(12)
-                .background(Color(red: 0.953, green: 0.949, blue: 0.945))
-                .overlay(
-                    Rectangle()
-                        .frame(height: 2)
-                        .foregroundColor(borderColor),
-                    alignment: .bottom
-                )
-
-                // Table rows
-                ScrollView {
-                    LazyVStack(spacing: 0) {
-                        ForEach(logs) { log in
-                            LogRow(log: log)
-                        }
-                    }
-                }
+            // Logs list with card layout
+            ForEach(logs) { log in
+                LogCard(log: log)
             }
-            .background(Color.white)
-            .cornerRadius(4)
-            .overlay(
-                RoundedRectangle(cornerRadius: 4)
-                    .stroke(borderColor, lineWidth: 1)
-            )
 
             // Pagination
             if logsTotalPages > 1 {
@@ -137,39 +95,54 @@ struct LogsView: View {
     }
 }
 
-struct LogRow: View {
+struct LogCard: View {
     let log: Log
 
     var body: some View {
-        HStack {
+        VStack(alignment: .leading, spacing: 8) {
+            // Status badge
+            HStack {
+                Text(log.success ? "SUCCESS" : "FAILED")
+                    .font(.system(size: 11, weight: .bold))
+                    .foregroundColor(log.success ? Color(red: 0.082, green: 0.341, blue: 0.141) : Color(red: 0.447, green: 0.11, blue: 0.141))
+                    .padding(.horizontal, 8)
+                    .padding(.vertical, 4)
+                    .background(log.success ? Color(red: 0.831, green: 0.929, blue: 0.855) : Color(red: 0.973, green: 0.843, blue: 0.855))
+                    .cornerRadius(4)
+
+                Spacer()
+            }
+
             // Timestamp
-            Text(formatTimestamp(log.timestamp))
-                .font(.system(size: 13))
-                .frame(width: 180, alignment: .leading)
+            VStack(alignment: .leading, spacing: 2) {
+                Text("TIMESTAMP")
+                    .font(.system(size: 11, weight: .semibold))
+                    .foregroundColor(Color(red: 0.376, green: 0.369, blue: 0.361))
+
+                Text(formatTimestamp(log.timestamp))
+                    .font(.system(size: 13))
+                    .foregroundColor(.primary)
+            }
 
             // Description
-            Text(log.description)
-                .font(.system(size: 14))
-                .frame(maxWidth: .infinity, alignment: .leading)
+            VStack(alignment: .leading, spacing: 2) {
+                Text("DESCRIPTION")
+                    .font(.system(size: 11, weight: .semibold))
+                    .foregroundColor(Color(red: 0.376, green: 0.369, blue: 0.361))
 
-            // Status badge
-            Text(log.success ? "SUCCESS" : "FAILED")
-                .font(.system(size: 12, weight: .bold))
-                .foregroundColor(log.success ? Color(red: 0.082, green: 0.341, blue: 0.141) : Color(red: 0.447, green: 0.11, blue: 0.141))
-                .padding(.horizontal, 8)
-                .padding(.vertical, 4)
-                .background(log.success ? Color(red: 0.831, green: 0.929, blue: 0.855) : Color(red: 0.973, green: 0.843, blue: 0.855))
-                .cornerRadius(4)
-                .frame(width: 100, alignment: .center)
+                Text(log.description)
+                    .font(.system(size: 13))
+                    .foregroundColor(.primary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
         }
-        .padding(.vertical, 8)
-        .padding(.horizontal, 12)
+        .padding(12)
+        .frame(maxWidth: .infinity, alignment: .leading)
         .background(Color.white)
+        .cornerRadius(4)
         .overlay(
-            Rectangle()
-                .frame(height: 1)
-                .foregroundColor(Color(red: 0.953, green: 0.949, blue: 0.945)),
-            alignment: .bottom
+            RoundedRectangle(cornerRadius: 4)
+                .stroke(Color(red: 0.882, green: 0.882, blue: 0.882), lineWidth: 1)
         )
     }
 
@@ -193,7 +166,7 @@ struct LogRow: View {
     LogsView(
         logs: .constant([
             Log(id: 1, timestamp: "2024-01-01T12:00:00Z", description: "Test log entry", success: true),
-            Log(id: 2, timestamp: "2024-01-01T12:05:00Z", description: "Failed operation", success: false)
+            Log(id: 2, timestamp: "2024-01-01T12:05:00Z", description: "Failed operation with a much longer description that should wrap around to multiple lines", success: false)
         ]),
         logsPage: .constant(1),
         logsTotalPages: .constant(1)

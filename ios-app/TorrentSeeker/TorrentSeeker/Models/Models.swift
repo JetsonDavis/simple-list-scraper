@@ -12,7 +12,7 @@ struct Item: Codable, Identifiable {
     let text: String
 }
 
-struct URL: Codable, Identifiable {
+struct SiteURL: Codable, Identifiable {
     let id: Int
     let url: String
     let displayName: String?

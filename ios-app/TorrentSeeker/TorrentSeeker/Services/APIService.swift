@@ -17,8 +17,8 @@ enum APIError: Error {
 class APIService {
     static let shared = APIService()
 
-    // Update this to your backend URL
-    private let baseURL = "http://localhost:8080/api"
+    // Backend URL - matches the Go API server
+    private let baseURL = "http://99.104.116.11:8080/api"
 
     private var token: String? {
         UserDefaults.standard.string(forKey: "authToken")
@@ -28,7 +28,7 @@ class APIService {
 
     func login(username: String, password: String) async throws -> AuthResponse {
         let endpoint = "\(baseURL)/auth/login"
-        var request = URLRequest(url: URL(string: endpoint)!)
+        var request = URLRequest(url: Foundation.URL(string: endpoint)!)
         request.httpMethod = "POST"
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
 
@@ -51,7 +51,7 @@ class APIService {
 
     func register(username: String, password: String) async throws -> AuthResponse {
         let endpoint = "\(baseURL)/auth/register"
-        var request = URLRequest(url: URL(string: endpoint)!)
+        var request = URLRequest(url: Foundation.URL(string: endpoint)!)
         request.httpMethod = "POST"
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
 
@@ -137,7 +137,7 @@ class APIService {
 
     // MARK: - URLs
 
-    func getURLs() async throws -> [URL] {
+    func getURLs() async throws -> [SiteURL] {
         try await authFetch(endpoint: "\(baseURL)/urls")
     }
 
