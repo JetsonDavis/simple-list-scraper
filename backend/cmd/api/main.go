@@ -377,8 +377,7 @@ func runWorker() {
 
                 // Check if this URL was previously soft-deleted for this item
                 if softDeletedURLs[r.URL] {
-                    matchesFound++
-                    log.Printf("SOFT_DELETED_SKIP site=%s url=%s title=%q - previously hidden by user (match %d/%d)\n", s.Name(), r.URL, r.Title, matchesFound, maxMatchesPerItem)
+                    log.Printf("SOFT_DELETED_SKIP site=%s url=%s title=%q - previously hidden by user\n", s.Name(), r.URL, r.Title)
                     continue
                 }
 
@@ -518,30 +517,41 @@ func runWorker() {
                     magnetLink = ""
                 }
 
-                log.Printf("Attempting to insert match with magnet_link=%q\n", magnetLink)
+                // Extract file size, seeds, and leechers from entities BEFORE insertion
+                var fileSize, seeds, leechers string
+                if err := json.Unmarshal(entitiesJSON, &entities); err == nil {
+                    for _, entity := range entities {
+                        entityType := strings.ToUpper(entity.Type)
+                        if entityType == "FILE SIZE" || entityType == "FILESIZE" {
+                            fileSize = entity.Text
+                        } else if entityType == "SEEDS" {
+                            seeds = entity.Text
+                        } else if entityType == "LEECHERS" {
+                            leechers = entity.Text
+                        }
+                    }
+                }
+
+                log.Printf("Attempting to insert match with magnet_link=%q seeds=%q\n", magnetLink, seeds)
                 matchID, inserted, err := insertMatchWithEntities(it.ID, r.Title, r.URL, s.Name(), r.Title, magnetLink, entitiesJSON)
                 if err != nil {
                     log.Printf("insert match error: %v\n", err)
                     continue
                 }
                 if inserted {
-                    matchesFound++
-                    log.Printf("MATCH site=%s item=%q title=%q url=%s magnet=%q (match %d/%d)\n",
-                        s.Name(), it.Text, r.Title, r.URL, magnetLink, matchesFound, maxMatchesPerItem)
-
-                    // Extract file size from entities for WebSocket broadcast
-                    var fileSize string
-                    var entities []Entity
-                    if err := json.Unmarshal(entitiesJSON, &entities); err == nil {
-                        for _, entity := range entities {
-                            if strings.ToUpper(entity.Type) == "FILE SIZE" || strings.ToUpper(entity.Type) == "FILESIZE" {
-                                fileSize = entity.Text
-                                break
-                            }
-                        }
+                    // Check if this match has zero seeds - if so, it was auto soft-deleted
+                    if seeds == "0" {
+                        log.Printf("ZERO_SEEDS_AUTO_SOFT_DELETE site=%s item=%q title=%q url=%s seeds=%s - match inserted but soft-deleted, not counted\n",
+                            s.Name(), it.Text, r.Title, r.URL, seeds)
+                        // Don't increment matchesFound, don't broadcast, don't send SMS
+                        continue
                     }
 
-                    // Broadcast new match via WebSocket with ID and file_size
+                    matchesFound++
+                    log.Printf("MATCH site=%s item=%q title=%q url=%s magnet=%q seeds=%s (match %d/%d)\n",
+                        s.Name(), it.Text, r.Title, r.URL, magnetLink, seeds, matchesFound, maxMatchesPerItem)
+
+                    // Broadcast new match via WebSocket with ID, file_size, seeds, and leechers
                     broadcastNewMatch(map[string]any{
                         "id":           matchID,
                         "item":         it.Text,
@@ -550,6 +560,8 @@ func runWorker() {
                         "torrent_text": r.Title,
                         "magnet_link":  magnetLink,
                         "file_size":    fileSize,
+                        "seeds":        seeds,
+                        "leechers":     leechers,
                         "created":      time.Now().Format(time.RFC3339),
                     })
 
@@ -567,12 +579,13 @@ func runWorker() {
         }
 
         // Log completion of this item
+        // Only count as success if we have actual matches (not soft-deleted)
         success := matchesFound > 0
         description := fmt.Sprintf("Item '%s' completed with %d match(es)", it.Text, matchesFound)
         if err := insertLog(description, success); err != nil {
             log.Printf("Failed to insert log for item %q: %v\n", it.Text, err)
         } else {
-            log.Printf("LOG: %s (success=%v)\n", description, success)
+            log.Printf("LOG: %s (success=%v, matchesFound=%d)\n", description, success, matchesFound)
 
             // Broadcast new log via WebSocket
             broadcastNewLog(map[string]any{
@@ -868,7 +881,7 @@ Schema:
   "entities": [
     {
       "text": "string",
-      "type": "FILM TITLE|YEAR|RESOLUTION|VIDEO FORMAT",
+      "type": "FILM TITLE|YEAR|RESOLUTION|VIDEO FORMAT|FILE SIZE|SEEDS|LEECHERS",
       "confidence": 0.95
     }
   ]
@@ -948,26 +961,36 @@ func insertMatchDedup(itemID int64, matchedText, matchedURL, sourceSite, torrent
 }
 
 func insertMatchWithEntities(itemID int64, matchedText, matchedURL, sourceSite, torrentText, magnetLink string, entitiesJSON []byte) (int64, bool, error) {
-    // Extract file size from entities
-    var fileSize string
+    // Extract file size, seeds, and leechers from entities
+    var fileSize, seeds, leechers string
     var entities []Entity
     if err := json.Unmarshal(entitiesJSON, &entities); err == nil {
         for _, entity := range entities {
-            if strings.ToUpper(entity.Type) == "FILE SIZE" || strings.ToUpper(entity.Type) == "FILESIZE" {
+            entityType := strings.ToUpper(entity.Type)
+            if entityType == "FILE SIZE" || entityType == "FILESIZE" {
                 fileSize = entity.Text
-                break
+            } else if entityType == "SEEDS" {
+                seeds = entity.Text
+            } else if entityType == "LEECHERS" {
+                leechers = entity.Text
             }
         }
+    }
+
+    // Check if seeds is "0" - if so, auto soft-delete
+    softDelete := false
+    if seeds == "0" {
+        softDelete = true
     }
 
     // ON CONFLICT DO NOTHING provides dedupe via unique index (item_id, matched_url, source_site)
     var insertedID int64
     err := db.QueryRow(`
-        INSERT INTO matches(item_id, matched_text, matched_url, source_site, torrent_text, magnet_link, entities, file_size)
-        VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+        INSERT INTO matches(item_id, matched_text, matched_url, source_site, torrent_text, magnet_link, entities, file_size, seeds, leechers, soft_delete)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
         ON CONFLICT (item_id, matched_url, source_site) DO NOTHING
         RETURNING id
-    `, itemID, matchedText, matchedURL, sourceSite, torrentText, magnetLink, entitiesJSON, fileSize).Scan(&insertedID)
+    `, itemID, matchedText, matchedURL, sourceSite, torrentText, magnetLink, entitiesJSON, fileSize, seeds, leechers, softDelete).Scan(&insertedID)
     
     if err != nil {
         if err == sql.ErrNoRows {
@@ -1371,7 +1394,7 @@ func matchesHandler(w http.ResponseWriter, r *http.Request) {
     }
 
     rows, err := db.Query(`
-        SELECT m.id, i.text, m.matched_url, m.source_site, COALESCE(m.torrent_text, ''), COALESCE(m.magnet_link, ''), COALESCE(m.file_size, ''), m.created_at
+        SELECT m.id, i.text, m.matched_url, m.source_site, COALESCE(m.torrent_text, ''), COALESCE(m.magnet_link, ''), COALESCE(m.file_size, ''), COALESCE(m.seeds, ''), COALESCE(m.leechers, ''), m.created_at
         FROM matches m
         JOIN items i ON i.id = m.item_id
         WHERE m.soft_delete = FALSE
@@ -1392,12 +1415,14 @@ func matchesHandler(w http.ResponseWriter, r *http.Request) {
         TorrentText string `json:"torrent_text,omitempty"`
         MagnetLink  string `json:"magnet_link,omitempty"`
         FileSize    string `json:"file_size,omitempty"`
+        Seeds       string `json:"seeds,omitempty"`
+        Leechers    string `json:"leechers,omitempty"`
         Created     string `json:"created"`
     }
     out := make([]Match, 0, 200)
     for rows.Next() {
         var m Match
-        if err := rows.Scan(&m.ID, &m.Item, &m.URL, &m.Site, &m.TorrentText, &m.MagnetLink, &m.FileSize, &m.Created); err != nil {
+        if err := rows.Scan(&m.ID, &m.Item, &m.URL, &m.Site, &m.TorrentText, &m.MagnetLink, &m.FileSize, &m.Seeds, &m.Leechers, &m.Created); err != nil {
             http.Error(w, err.Error(), http.StatusInternalServerError)
             return
         }
@@ -1712,6 +1737,8 @@ func initDB(db *sql.DB) error {
             magnet_link TEXT,
             entities JSONB,
             file_size VARCHAR(50),
+            seeds VARCHAR(20),
+            leechers VARCHAR(20),
             soft_delete BOOLEAN DEFAULT FALSE,
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
             FOREIGN KEY (item_id) REFERENCES items(id) ON DELETE CASCADE

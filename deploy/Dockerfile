@@ -69,6 +69,7 @@ RUN go install github.com/playwright-community/playwright-go/cmd/playwright@v0.4
 
 WORKDIR /app
 COPY --from=backend-build /out/api /app/api
+COPY backend/migrations /app/migrations
 
 # Run playwright.Install() during build by starting the app briefly with DISABLE_PLAYWRIGHT=false
 # This ensures the Go library installs its driver in the correct location

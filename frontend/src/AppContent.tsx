@@ -2,7 +2,7 @@ import { useEffect, useState } from "react";
 
 type Item = { id: number; text: string };
 type URL = { id: number; url: string; display_name?: string; config?: string };
-type Match = { id: number; item: string; url: string; site: string; torrent_text?: string; magnet_link?: string; file_size?: string; created: string };
+type Match = { id: number; item: string; url: string; site: string; torrent_text?: string; magnet_link?: string; file_size?: string; seeds?: string; leechers?: string; created: string };
 type Log = { id: number; timestamp: string; description: string; success: boolean };
 type LogsResponse = { logs: Log[]; page: number; page_size: number; total: number; total_pages: number };
 
@@ -492,11 +492,13 @@ export default function App({ token, username, onLogout }: AppProps) {
           <table className="table" style={{ width: '100%' }}>
             <thead>
               <tr>
-                <th style={{ width: '12%' }}>ITEM</th>
-                <th style={{ width: '8%' }}>SITE</th>
-                <th style={{ width: '45%' }}>TORRENT TEXT</th>
-                <th style={{ width: '8%' }}>SIZE</th>
-                <th style={{ width: '6%', textAlign: 'center' }}>MAGNET</th>
+                <th style={{ width: '10%' }}>ITEM</th>
+                <th style={{ width: '7%' }}>SITE</th>
+                <th style={{ width: '40%' }}>TORRENT TEXT</th>
+                <th style={{ width: '7%' }}>SIZE</th>
+                <th style={{ width: '5%' }}>SEEDS</th>
+                <th style={{ width: '5%' }}>LEECH</th>
+                <th style={{ width: '5%', textAlign: 'center' }}>MAGNET</th>
                 <th style={{ width: '10%' }}>WHEN</th>
                 <th style={{ width: '6%', textAlign: 'center' }}>ACTION</th>
               </tr>
@@ -512,6 +514,8 @@ export default function App({ token, username, onLogout }: AppProps) {
                     </a>
                   </td>
                   <td style={{ whiteSpace: 'nowrap' }}>{m.file_size || '-'}</td>
+                  <td style={{ whiteSpace: 'nowrap' }}>{m.seeds || '-'}</td>
+                  <td style={{ whiteSpace: 'nowrap' }}>{m.leechers || '-'}</td>
                   <td style={{ textAlign: 'center' }}>
                     {m.magnet_link ? (
                       <a href={m.magnet_link} title="Open magnet link">
